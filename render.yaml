@@ -3,15 +3,19 @@ services:
     name: unimind-api
     runtime: python
     buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    startCommand: gunicorn main:app --workers 1 --worker-class uvicorn.workers.UvicornWorker --bind 0.0.0.0:$PORT --timeout 120
     envVars:
       - key: GEMINI_API_KEY
         sync: false
-      - key: RENDER_DISK_PATH
-        value: /opt/render/project/src/storage
+      - key: SUPABASE_DB_HOST
+        value: db.ppizfuwwlylahzimegfi.supabase.co
+      - key: SUPABASE_DB_PORT
+        value: "5432"
+      - key: SUPABASE_DB_NAME
+        value: postgres
+      - key: SUPABASE_DB_USER
+        value: postgres
+      - key: SUPABASE_DB_PASSWORD
+        sync: false
       - key: PYTHON_VERSION
         value: 3.11.9
-    disk:
-      name: unimind-storage
-      mountPath: /opt/render/project/src/storage
-      sizeGB: 1

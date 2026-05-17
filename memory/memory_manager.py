@@ -28,6 +28,7 @@ try:
         SHORT_TERM_MAX,
         SQLITE_DB_PATH,
         STORAGE_DIR,
+        supabase_db_enabled,
     )
     from ..services.llm_service import LLMService, LLMUnavailableError
 except ImportError:  # pragma: no cover
@@ -42,6 +43,7 @@ except ImportError:  # pragma: no cover
         SHORT_TERM_MAX,
         SQLITE_DB_PATH,
         STORAGE_DIR,
+        supabase_db_enabled,
     )
     from services.llm_service import LLMService, LLMUnavailableError  # type: ignore
 
@@ -70,16 +72,57 @@ class MemoryManager:
         llm_service: LLMService | None = None,
         embedding_service: EmbeddingService | None = None,
     ):
+        self.embedding_service = embedding_service or EmbeddingService()
+        self.fact_extractor = FactExtractor()
+        self.summarizer = Summarizer()
+        self.llm_service = llm_service or LLMService()
+        self._using_supabase = False
+
+        # Auto-detect: Supabase PostgreSQL for cloud, SQLite+FAISS for local
+        if supabase_db_enabled():
+            try:
+                from .supabase_storage import SupabaseStorage
+                from .supabase_retriever import SupabaseRetriever
+
+                self.storage = SupabaseStorage()
+                self.retriever = SupabaseRetriever(
+                    storage=self.storage,
+                    embedding_service=self.embedding_service,
+                )
+                self._using_supabase = True
+                logger.info("MemoryManager using Supabase PostgreSQL backend")
+            except Exception as exc:
+                logger.warning(
+                    "Supabase init failed, falling back to SQLite: %s", exc,
+                )
+                self._init_local(storage_dir, db_path, faiss_index_path, faiss_ids_path)
+        else:
+            self._init_local(storage_dir, db_path, faiss_index_path, faiss_ids_path)
+
+        self.short_term = _ShortTermAdapter(self)
+        self.semantic = _SemanticAdapter(self)
+        self.episodic = _EpisodicAdapter(self)
+
+        if run_migrations and not self._using_supabase:
+            base_dir = Path(storage_dir) if storage_dir else STORAGE_DIR
+            self._migrate_legacy_json(base_dir)
+
+    def _init_local(
+        self,
+        storage_dir: str | Path | None,
+        db_path: str | Path | None,
+        faiss_index_path: str | Path | None,
+        faiss_ids_path: str | Path | None,
+    ) -> None:
+        """Initialize SQLite + FAISS local storage (development / fallback)."""
         base_dir = Path(storage_dir) if storage_dir else STORAGE_DIR
         base_dir.mkdir(parents=True, exist_ok=True)
         default_faiss_dir = base_dir / "faiss"
         default_faiss_dir.mkdir(parents=True, exist_ok=True)
-
         self.db_path = Path(db_path) if db_path else (
             base_dir / "memory.db" if storage_dir else Path(SQLITE_DB_PATH)
         )
         self.storage = MemoryStorage(self.db_path)
-        self.embedding_service = embedding_service or EmbeddingService()
         self.retriever = MemoryRetriever(
             storage=self.storage,
             embedding_service=self.embedding_service,
@@ -88,16 +131,6 @@ class MemoryManager:
             ids_path=faiss_ids_path
             or (default_faiss_dir / "memory_ids.json" if storage_dir else FAISS_IDS_PATH),
         )
-        self.fact_extractor = FactExtractor()
-        self.summarizer = Summarizer()
-        self.llm_service = llm_service or LLMService()
-
-        self.short_term = _ShortTermAdapter(self)
-        self.semantic = _SemanticAdapter(self)
-        self.episodic = _EpisodicAdapter(self)
-
-        if run_migrations:
-            self._migrate_legacy_json(base_dir)
 
     def add_message(
         self,

@@ -18,14 +18,14 @@ except ImportError:  # pragma: no cover
 
 validate_config()
 logging.basicConfig(
-    level=logging.WARNING,
+    level=logging.INFO,
     format="%(levelname)s:%(name)s:%(message)s",
 )
 
 app = FastAPI(
     title="UniMind Memory API",
-    description="Simple FastAPI memory backend with SQLite and FAISS.",
-    version="2.0.0",
+    description="FastAPI memory backend with SQLite/Supabase and semantic search.",
+    version="2.1.0",
     docs_url="/docs",
     redoc_url="/redoc",
 )
@@ -53,7 +53,7 @@ async def root():
         "docs": "/docs",
         "health": "/health",
         "legacy_health": "/api/v1/health",
-        "version": "2.0.0",
+        "version": "2.1.0",
     }
 
 

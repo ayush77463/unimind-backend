@@ -35,6 +35,13 @@ GEMINI_EMBEDDING_MODEL = os.getenv(
     "models/text-embedding-004",
 )
 
+# ── Supabase / PostgreSQL cloud persistence ──────────────────
+SUPABASE_DB_HOST = os.getenv("SUPABASE_DB_HOST", "")
+SUPABASE_DB_PORT = int(os.getenv("SUPABASE_DB_PORT", "5432"))
+SUPABASE_DB_NAME = os.getenv("SUPABASE_DB_NAME", "postgres")
+SUPABASE_DB_USER = os.getenv("SUPABASE_DB_USER", "postgres")
+SUPABASE_DB_PASSWORD = os.getenv("SUPABASE_DB_PASSWORD", "")
+
 SHORT_TERM_MAX = int(os.getenv("SHORT_TERM_MEMORY_SIZE", "20"))
 EPISODIC_MAX = int(os.getenv("EPISODIC_MEMORY_MAX", "100"))
 SEMANTIC_MAX = int(os.getenv("SEMANTIC_MEMORY_MAX", "500"))
@@ -64,11 +71,19 @@ def gemini_enabled() -> bool:
     )
 
 
+def supabase_db_enabled() -> bool:
+    """Return True when Supabase PostgreSQL credentials are configured."""
+    return bool(SUPABASE_DB_HOST.strip() and SUPABASE_DB_PASSWORD.strip())
+
+
 def validate_config() -> bool:
     """Print a small startup summary without making API keys mandatory."""
-    print("UniMind memory storage:", STORAGE_DIR)
-    print("SQLite database:", SQLITE_DB_PATH)
-    print("FAISS index:", FAISS_INDEX_PATH)
+    if supabase_db_enabled():
+        print("Storage backend: Supabase PostgreSQL at", SUPABASE_DB_HOST)
+    else:
+        print("Storage backend: local SQLite at", SQLITE_DB_PATH)
+        print("UniMind memory storage:", STORAGE_DIR)
+        print("FAISS index:", FAISS_INDEX_PATH)
     if gemini_enabled():
         print("Gemini is configured for LLM calls and embeddings")
         return True

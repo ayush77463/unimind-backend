@@ -41,7 +41,7 @@ except ImportError:  # pragma: no cover
     )
 
 router = APIRouter(tags=["Memory"])
-memory_manager = MemoryManager()
+memory_manager: MemoryManager | None = None
 
 
 def set_memory_manager(manager: MemoryManager) -> None:
@@ -50,6 +50,13 @@ def set_memory_manager(manager: MemoryManager) -> None:
 
 
 def get_memory_manager() -> MemoryManager:
+    global memory_manager
+    if memory_manager is None:
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.info("Lazy-initializing MemoryManager on first request...")
+        memory_manager = MemoryManager()
+        logger.info("MemoryManager ready (supabase=%s)", memory_manager._using_supabase)
     return memory_manager
 
 
@@ -62,18 +69,27 @@ def _error(message: str, status_code: int = 500) -> JSONResponse:
 
 @router.get("/health")
 async def health_check():
-    manager = get_memory_manager()
-    return {
-        "success": True,
-        "status": "healthy",
-        "service": "UniMind Memory API",
-        "version": "2.0.0",
-        "storage": "sqlite",
-        "vector_store": "faiss",
-        "embedding_provider": manager.embedding_service.provider,
-        "llm_available": manager.llm_service.available,
-        "memory_types": ["episodic", "semantic", "preference"],
-    }
+    try:
+        manager = get_memory_manager()
+        return {
+            "success": True,
+            "status": "healthy",
+            "service": "UniMind Memory API",
+            "version": "2.1.0",
+            "storage": "supabase_postgresql" if manager._using_supabase else "sqlite",
+            "vector_store": "postgresql" if manager._using_supabase else "faiss",
+            "embedding_provider": manager.embedding_service.provider,
+            "llm_available": manager.llm_service.available,
+            "memory_types": ["episodic", "semantic", "preference"],
+        }
+    except Exception as exc:
+        return {
+            "success": True,
+            "status": "starting",
+            "service": "UniMind Memory API",
+            "version": "2.1.0",
+            "note": f"Initializing: {exc}",
+        }
 
 
 @router.post("/memory/store", response_model=MemoryStoreResponse)
