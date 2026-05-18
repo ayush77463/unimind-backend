@@ -80,22 +80,17 @@ class MemoryManager:
 
         # Auto-detect: Supabase PostgreSQL for cloud, SQLite+FAISS for local
         if supabase_db_enabled():
-            try:
-                from .supabase_storage import SupabaseStorage
-                from .supabase_retriever import SupabaseRetriever
+            from .supabase_storage import SupabaseStorage
+            from .supabase_retriever import SupabaseRetriever
 
-                self.storage = SupabaseStorage()
-                self.retriever = SupabaseRetriever(
-                    storage=self.storage,
-                    embedding_service=self.embedding_service,
-                )
-                self._using_supabase = True
-                logger.info("MemoryManager using Supabase PostgreSQL backend")
-            except Exception as exc:
-                logger.warning(
-                    "Supabase init failed, falling back to SQLite: %s", exc,
-                )
-                self._init_local(storage_dir, db_path, faiss_index_path, faiss_ids_path)
+            logger.info("Initializing Supabase PostgreSQL backend...")
+            self.storage = SupabaseStorage()
+            self.retriever = SupabaseRetriever(
+                storage=self.storage,
+                embedding_service=self.embedding_service,
+            )
+            self._using_supabase = True
+            logger.info("MemoryManager successfully connected to Supabase PostgreSQL")
         else:
             self._init_local(storage_dir, db_path, faiss_index_path, faiss_ids_path)
 

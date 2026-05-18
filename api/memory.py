@@ -93,7 +93,7 @@ async def health_check():
 
 
 @router.post("/memory/store", response_model=MemoryStoreResponse)
-async def store_memory(request: MemoryStoreRequest):
+def store_memory(request: MemoryStoreRequest):
     try:
         manager = get_memory_manager()
         memory_id = manager.store_memory(
@@ -119,7 +119,7 @@ async def store_memory(request: MemoryStoreRequest):
     response_model=MemoryRetrieveResponse,
     response_model_exclude_none=True,
 )
-async def retrieve_memory(
+def retrieve_memory(
     user_id: Annotated[str, Query(min_length=1, max_length=100)],
     query: Annotated[str, Query(min_length=1, max_length=2000)],
     top_k: Annotated[int, Query(ge=1, le=20)] = 5,
@@ -152,7 +152,7 @@ async def retrieve_memory(
 
 
 @router.post("/memory/message")
-async def add_message_to_memory(request: AddMessageRequest):
+def add_message_to_memory(request: AddMessageRequest):
     try:
         manager = get_memory_manager()
         manager.add_message(
@@ -171,7 +171,7 @@ async def add_message_to_memory(request: AddMessageRequest):
 
 
 @router.post("/memory/exchange")
-async def add_exchange_to_memory(request: AddExchangeRequest):
+def add_exchange_to_memory(request: AddExchangeRequest):
     try:
         return get_memory_manager().add_exchange(
             user_id=request.user_id,
@@ -186,7 +186,7 @@ async def add_exchange_to_memory(request: AddExchangeRequest):
 
 
 @router.get("/memory/short-term/{user_id}")
-async def get_short_term_memory(user_id: str, last_n: int = Query(default=10, ge=1, le=100)):
+def get_short_term_memory(user_id: str, last_n: int = Query(default=10, ge=1, le=100)):
     manager = get_memory_manager()
     messages = manager.storage.get_recent_messages(user_id=user_id, last_n=last_n)
     count = manager.storage.get_message_count(user_id)
@@ -200,7 +200,7 @@ async def get_short_term_memory(user_id: str, last_n: int = Query(default=10, ge
 
 
 @router.post("/memory/episode/save")
-async def save_episode(request: SaveEpisodeRequest):
+def save_episode(request: SaveEpisodeRequest):
     try:
         episode_id = get_memory_manager().save_episode(
             user_id=request.user_id,
@@ -219,7 +219,7 @@ async def save_episode(request: SaveEpisodeRequest):
 
 
 @router.get("/memory/episodes/{user_id}")
-async def get_episodes(user_id: str, last_n: int = Query(default=5, ge=1, le=100)):
+def get_episodes(user_id: str, last_n: int = Query(default=5, ge=1, le=100)):
     episodes = get_memory_manager().episodic.get_recent_episodes(user_id, last_n)
     return {
         "success": True,
@@ -230,7 +230,7 @@ async def get_episodes(user_id: str, last_n: int = Query(default=5, ge=1, le=100
 
 
 @router.post("/memory/fact", response_model=FactResponse)
-async def add_fact(request: AddFactRequest):
+def add_fact(request: AddFactRequest):
     try:
         fact_id = get_memory_manager().add_fact(
             user_id=request.user_id,
@@ -251,7 +251,7 @@ async def add_fact(request: AddFactRequest):
     response_model=SearchResponse,
     response_model_exclude_none=True,
 )
-async def search_semantic_memory(request: SearchMemoryRequest):
+def search_semantic_memory(request: SearchMemoryRequest):
     try:
         manager = get_memory_manager()
         results = manager.retrieve_memories(
@@ -274,7 +274,7 @@ async def search_semantic_memory(request: SearchMemoryRequest):
 
 
 @router.get("/memory/facts/{user_id}")
-async def get_all_facts(user_id: str):
+def get_all_facts(user_id: str):
     facts = get_memory_manager().semantic.get_all_facts(user_id)
     return {
         "success": True,
@@ -285,7 +285,7 @@ async def get_all_facts(user_id: str):
 
 
 @router.get("/memory/all/{user_id}")
-async def get_all_memories(
+def get_all_memories(
     user_id: str,
     query: str = Query(default="", max_length=2000),
     category: str | None = Query(default=None, max_length=40),
@@ -313,7 +313,7 @@ async def get_all_memories(
 
 
 @router.delete("/memory/{memory_id}")
-async def delete_memory(memory_id: str):
+def delete_memory(memory_id: str):
     deleted = get_memory_manager().delete_memory(memory_id)
     if not deleted:
         raise HTTPException(status_code=404, detail="Memory not found")
@@ -321,7 +321,7 @@ async def delete_memory(memory_id: str):
 
 
 @router.post("/memory/pin")
-async def pin_memory(request: PinMemoryRequest):
+def pin_memory(request: PinMemoryRequest):
     memory = get_memory_manager().pin_memory(
         memory_id=request.memory_id,
         pinned=request.pinned,
@@ -337,12 +337,12 @@ async def pin_memory(request: PinMemoryRequest):
 
 
 @router.get("/memory/status/{user_id}", response_model=MemoryStatusResponse)
-async def get_memory_status(user_id: str):
+def get_memory_status(user_id: str):
     return MemoryStatusResponse(**get_memory_manager().get_status(user_id))
 
 
 @router.get("/memory/context/{user_id}")
-async def get_memory_context(
+def get_memory_context(
     user_id: str,
     query: str = Query("general", min_length=1, max_length=2000),
     debug: bool = Query(default=False),
@@ -376,13 +376,13 @@ async def get_memory_context(
 
 
 @router.delete("/memory/clear/{user_id}")
-async def clear_all_memory(user_id: str):
+def clear_all_memory(user_id: str):
     get_memory_manager().clear_all(user_id)
     return {"success": True, "message": f"All memory cleared for user: {user_id}"}
 
 
 @router.delete("/memory/short-term/{user_id}")
-async def clear_short_term(user_id: str):
+def clear_short_term(user_id: str):
     get_memory_manager().clear_short_term(user_id)
     return {"success": True, "message": "Short-term memory cleared"}
 

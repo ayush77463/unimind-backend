@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import uuid
+import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Any, Iterable
@@ -80,14 +81,32 @@ class SupabaseStorage:
             "user": SUPABASE_DB_USER,
             "password": SUPABASE_DB_PASSWORD,
             "sslmode": "require",
-            "connect_timeout": 10,
+            "connect_timeout": 30,
         }
         self._init_schema()
         logger.info("SupabaseStorage connected to %s", SUPABASE_DB_HOST)
 
     @contextmanager
     def _connect(self):
-        conn = psycopg2.connect(**self._dsn)
+        max_retries = 3
+        retry_delay = 2.0
+        last_exc = None
+        
+        for attempt in range(max_retries):
+            try:
+                conn = psycopg2.connect(**self._dsn)
+                break
+            except Exception as exc:
+                last_exc = exc
+                if attempt < max_retries - 1:
+                    logger.warning("Supabase connection failed (attempt %d/%d). Retrying in %.1fs: %s", 
+                                   attempt + 1, max_retries, retry_delay, exc)
+                    time.sleep(retry_delay)
+                    retry_delay *= 2.0
+                else:
+                    logger.error("Supabase connection failed after %d attempts: %s", max_retries, exc)
+                    raise
+
         try:
             yield conn
             conn.commit()

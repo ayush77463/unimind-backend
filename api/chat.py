@@ -20,7 +20,7 @@ router = APIRouter(tags=["Chat"])
 
 
 @router.post("/chat", response_model=ChatResponse)
-async def chat_with_memory(request: ChatRequest):
+def chat_with_memory(request: ChatRequest):
     try:
         result = get_memory_manager().chat_with_memory(
             user_id=request.user_id,
