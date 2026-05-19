@@ -98,14 +98,18 @@ class MemoryManager:
             from .supabase_retriever import SupabaseRetriever
 
             logger.info("Initializing Supabase PostgreSQL backend...")
-            self.storage = SupabaseStorage()
-            fallback_retriever = SupabaseRetriever(
-                storage=self.storage,
-                embedding_service=self.embedding_service,
-            )
-            self.retriever = self._wrap_vector_retriever(fallback_retriever)
-            self._using_supabase = True
-            logger.info("MemoryManager successfully connected to Supabase PostgreSQL")
+            try:
+                self.storage = SupabaseStorage()
+                fallback_retriever = SupabaseRetriever(
+                    storage=self.storage,
+                    embedding_service=self.embedding_service,
+                )
+                self.retriever = self._wrap_vector_retriever(fallback_retriever)
+                self._using_supabase = True
+                logger.info("MemoryManager successfully connected to Supabase PostgreSQL")
+            except Exception as exc:
+                logger.error("Failed to connect to Supabase (IPv6/network issue?). Falling back to SQLite: %s", exc)
+                self._init_local(storage_dir, db_path, faiss_index_path, faiss_ids_path)
         else:
             self._init_local(storage_dir, db_path, faiss_index_path, faiss_ids_path)
 
