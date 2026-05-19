@@ -26,6 +26,10 @@ CREATE TABLE IF NOT EXISTS memories (
     content_norm TEXT NOT NULL,
     summary TEXT,
     importance DOUBLE PRECISION NOT NULL DEFAULT 0.5,
+    importance_score DOUBLE PRECISION DEFAULT 0.5,
+    importance_label TEXT DEFAULT 'Medium',
+    category TEXT DEFAULT 'General',
+    sentiment TEXT DEFAULT 'Neutral',
     source TEXT NOT NULL DEFAULT 'manual',
     metadata_json TEXT NOT NULL DEFAULT '{}',
     embedding REAL[],
@@ -39,6 +43,41 @@ CREATE INDEX IF NOT EXISTS idx_memories_user_type
     ON memories(user_id, memory_type);
 CREATE INDEX IF NOT EXISTS idx_memories_user_norm
     ON memories(user_id, memory_type, content_norm);
+
+-- Additive intelligence columns for existing deployments.
+ALTER TABLE memories
+    ADD COLUMN IF NOT EXISTS importance_score DOUBLE PRECISION DEFAULT 0.5;
+ALTER TABLE memories
+    ADD COLUMN IF NOT EXISTS importance_label TEXT DEFAULT 'Medium';
+ALTER TABLE memories
+    ADD COLUMN IF NOT EXISTS category TEXT DEFAULT 'General';
+ALTER TABLE memories
+    ADD COLUMN IF NOT EXISTS sentiment TEXT DEFAULT 'Neutral';
+
+UPDATE memories
+SET importance_score = importance
+WHERE importance_score IS NULL;
+
+UPDATE memories
+SET importance_label = CASE
+    WHEN COALESCE(importance_score, importance, 0.5) >= 0.75 THEN 'High'
+    WHEN COALESCE(importance_score, importance, 0.5) >= 0.45 THEN 'Medium'
+    ELSE 'Low'
+END
+WHERE importance_label IS NULL OR BTRIM(importance_label) = '';
+
+UPDATE memories
+SET category = 'General'
+WHERE category IS NULL OR BTRIM(category) = '';
+
+UPDATE memories
+SET sentiment = 'Neutral'
+WHERE sentiment IS NULL OR BTRIM(sentiment) = '';
+
+CREATE INDEX IF NOT EXISTS idx_memories_user_category
+    ON memories(user_id, category);
+CREATE INDEX IF NOT EXISTS idx_memories_user_sentiment
+    ON memories(user_id, sentiment);
 
 -- Migrations tracking
 CREATE TABLE IF NOT EXISTS migrations (

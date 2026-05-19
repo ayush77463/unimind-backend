@@ -62,9 +62,9 @@ def chat_with_memory(request: ChatRequest):
 
 @router.post("/chat/stream")
 async def stream_chat_with_memory(request: ChatRequest):
-    def events():
+    async def events():
         try:
-            for item in get_memory_manager().stream_chat_with_memory(
+            async for item in get_memory_manager().stream_chat_with_memory(
                 user_id=request.user_id,
                 user_message=request.message,
                 session_id=request.session_id,

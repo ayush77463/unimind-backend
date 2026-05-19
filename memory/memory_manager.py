@@ -1,15 +1,19 @@
 """Custom long-term memory engine for UniMind.
 
-This module intentionally avoids LangChain, LangGraph, agents, and graph
-pipelines. The architecture is plain Python: validate input, store records,
-embed text, retrieve with FAISS, rank memories, and build an explainable prompt.
+This module keeps UniMind's direct FastAPI memory architecture while using
+focused AI/DS components: embeddings, vector retrieval, semantic enrichment,
+and small LangChain prompt/document utilities. It still avoids agents,
+LangGraph, and framework rewrites.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import os
 import re
+import threading
+import time
 import uuid
 from collections import Counter
 from datetime import datetime, timezone
@@ -21,6 +25,7 @@ try:
         EPISODIC_MAX,
         FAISS_IDS_PATH,
         FAISS_INDEX_PATH,
+        CHROMA_DIR,
         LEGACY_EPISODIC_FILE,
         LEGACY_SEMANTIC_FILE,
         LEGACY_SHORT_TERM_FILE,
@@ -28,6 +33,7 @@ try:
         SHORT_TERM_MAX,
         SQLITE_DB_PATH,
         STORAGE_DIR,
+        UNIMIND_VECTOR_BACKEND,
         supabase_db_enabled,
     )
     from ..services.llm_service import LLMService, LLMUnavailableError
@@ -36,6 +42,7 @@ except ImportError:  # pragma: no cover
         EPISODIC_MAX,
         FAISS_IDS_PATH,
         FAISS_INDEX_PATH,
+        CHROMA_DIR,
         LEGACY_EPISODIC_FILE,
         LEGACY_SEMANTIC_FILE,
         LEGACY_SHORT_TERM_FILE,
@@ -43,19 +50,21 @@ except ImportError:  # pragma: no cover
         SHORT_TERM_MAX,
         SQLITE_DB_PATH,
         STORAGE_DIR,
+        UNIMIND_VECTOR_BACKEND,
         supabase_db_enabled,
     )
     from services.llm_service import LLMService, LLMUnavailableError  # type: ignore
 
 from .embedding_service import EmbeddingService
 from .fact_extractor import ExtractedMemory, FactExtractor
+from .intelligence import MemoryIntelligenceAnalyzer
 from .retrieval import MemoryRetriever
-from .scoring import decayed_importance, importance_for_category
+from .scoring import decayed_importance, importance_for_category, importance_label_for_score
 from .storage import MemoryStorage, utc_now
 from .summarizer import Summarizer
 
 MEMORY_TYPES = {"episodic", "semantic", "preference"}
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("unimind.memory")
 
 
 class MemoryManager:
@@ -74,9 +83,14 @@ class MemoryManager:
     ):
         self.embedding_service = embedding_service or EmbeddingService()
         self.fact_extractor = FactExtractor()
+        self.intelligence = MemoryIntelligenceAnalyzer(self.embedding_service)
         self.summarizer = Summarizer()
         self.llm_service = llm_service or LLMService()
         self._using_supabase = False
+        self.vector_backend = UNIMIND_VECTOR_BACKEND
+        self._decay_ttl_seconds = float(os.getenv("UNIMIND_DECAY_TTL_SECONDS", "21600"))
+        self._decay_last_applied: dict[str, float] = {}
+        self._decay_lock = threading.Lock()
 
         # Auto-detect: Supabase PostgreSQL for cloud, SQLite+FAISS for local
         if supabase_db_enabled():
@@ -85,10 +99,11 @@ class MemoryManager:
 
             logger.info("Initializing Supabase PostgreSQL backend...")
             self.storage = SupabaseStorage()
-            self.retriever = SupabaseRetriever(
+            fallback_retriever = SupabaseRetriever(
                 storage=self.storage,
                 embedding_service=self.embedding_service,
             )
+            self.retriever = self._wrap_vector_retriever(fallback_retriever)
             self._using_supabase = True
             logger.info("MemoryManager successfully connected to Supabase PostgreSQL")
         else:
@@ -118,7 +133,7 @@ class MemoryManager:
             base_dir / "memory.db" if storage_dir else Path(SQLITE_DB_PATH)
         )
         self.storage = MemoryStorage(self.db_path)
-        self.retriever = MemoryRetriever(
+        fallback_retriever = MemoryRetriever(
             storage=self.storage,
             embedding_service=self.embedding_service,
             index_path=faiss_index_path
@@ -126,6 +141,26 @@ class MemoryManager:
             ids_path=faiss_ids_path
             or (default_faiss_dir / "memory_ids.json" if storage_dir else FAISS_IDS_PATH),
         )
+        self.retriever = self._wrap_vector_retriever(
+            fallback_retriever,
+            chroma_dir=(base_dir / "chroma" if storage_dir else CHROMA_DIR),
+        )
+
+    def _wrap_vector_retriever(self, fallback_retriever, chroma_dir: str | Path | None = None):
+        if self.vector_backend != "chroma":
+            return fallback_retriever
+        try:
+            from .chroma_retriever import ChromaRetriever
+
+            return ChromaRetriever(
+                storage=self.storage,
+                embedding_service=self.embedding_service,
+                fallback_retriever=fallback_retriever,
+                persist_dir=chroma_dir or CHROMA_DIR,
+            )
+        except Exception as exc:
+            logger.warning("Chroma retriever setup failed; using fallback retriever: %s", exc)
+            return fallback_retriever
 
     def add_message(
         self,
@@ -192,8 +227,9 @@ class MemoryManager:
         debug: bool = False,
         min_evidence: float = 0.0,
     ) -> list[dict[str, Any]]:
+        start = time.time()
         self.apply_memory_decay(user_id=user_id)
-        return self.retriever.search(
+        results = self.retriever.search(
             user_id=user_id,
             query=query,
             top_k=top_k,
@@ -201,6 +237,12 @@ class MemoryManager:
             debug=debug,
             min_evidence=min_evidence,
         )
+        elapsed = round(time.time() - start, 3)
+        logger.info(
+            "retrieve_memories: user=%s query='%.40s' types=%s results=%d (%.3fs)",
+            user_id, query, list(memory_types or []), len(results), elapsed,
+        )
+        return results
 
     def build_context(self, user_id: str, query: str, top_k: int = 5) -> str:
         return self.build_context_payload(
@@ -410,7 +452,7 @@ class MemoryManager:
             },
         }
 
-    def stream_chat_with_memory(
+    async def stream_chat_with_memory(
         self,
         user_id: str,
         user_message: str,
@@ -435,12 +477,8 @@ class MemoryManager:
         )
 
         full_response: list[str] = []
-        stream = getattr(self.llm_service, "generate_response_stream", None)
         try:
-            chunks = stream(prompt) if callable(stream) else self._smooth_chunks(
-                self.llm_service.generate_response(prompt)
-            )
-            for chunk in chunks:
+            async for chunk in self.llm_service.agenerate_response_stream(prompt):
                 text = str(chunk)
                 if not text:
                     continue
@@ -519,7 +557,10 @@ class MemoryManager:
         if existing is None:
             return False
         self.storage.delete_memory(memory_id)
-        self.retriever.rebuild()
+        if hasattr(self.retriever, "delete_memory"):
+            self.retriever.delete_memory(memory_id)
+        else:
+            self.retriever.rebuild()
         return True
 
     def pin_memory(self, memory_id: str, pinned: bool) -> dict[str, Any] | None:
@@ -534,10 +575,18 @@ class MemoryManager:
 
     def clear_all(self, user_id: str) -> None:
         self.storage.clear_user(user_id)
-        self.retriever.rebuild()
+        if hasattr(self.retriever, "clear_user"):
+            self.retriever.clear_user(user_id)
+        else:
+            self.retriever.rebuild()
 
     def clear_short_term(self, user_id: str) -> None:
         self.storage.clear_messages(user_id)
+
+    def close(self) -> None:
+        close = getattr(self.retriever, "close", None)
+        if callable(close):
+            close()
 
     def get_status(self, user_id: str) -> dict[str, Any]:
         self.apply_memory_decay(user_id=user_id)
@@ -549,6 +598,129 @@ class MemoryManager:
             "total_facts": len(facts),
             "total_episodes": len(episodes),
             "recent_episode_summaries": episodes[-5:],
+        }
+
+    def get_analytics(self, user_id: str) -> dict[str, Any]:
+        self.apply_memory_decay(user_id=user_id)
+        memories = [
+            self._memory_card(memory)
+            for memory in self.storage.list_memories(user_id=user_id)
+        ]
+        if not memories:
+            return {
+                "success": True,
+                "user_id": user_id,
+                "total_memories": 0,
+                "high_importance_memories": 0,
+                "most_discussed_topic": "General",
+                "dominant_sentiment": "Neutral",
+                "category_distribution": {},
+                "sentiment_distribution": {},
+                "importance_distribution": {},
+                "memory_type_distribution": {},
+                "average_importance": 0.0,
+                "topic_distribution": {},
+                "source_distribution": {},
+                "embedding_provider_distribution": {},
+                "memory_trends": {},
+                "importance_statistics": {},
+                "sentiment_statistics": {},
+                "ai_pipeline": "pandas_numpy_analytics",
+            }
+
+        try:
+            import pandas as pd
+
+            frame = pd.DataFrame(memories)
+            frame["importance_score"] = pd.to_numeric(
+                frame.get("importance_score", 0.0),
+                errors="coerce",
+            ).fillna(0.0)
+            frame["category"] = frame.get("category", "General").fillna("General").astype(str)
+            frame["sentiment"] = frame.get("sentiment", "Neutral").fillna("Neutral").astype(str)
+            frame["importance_label"] = (
+                frame.get("importance_label", "Medium").fillna("Medium").astype(str)
+            )
+            frame["memory_type"] = frame.get("memory_type", "semantic").fillna("semantic").astype(str)
+            frame["source"] = frame.get("source", "memory").fillna("memory").astype(str)
+            frame["embedding_provider"] = (
+                frame.get("embedding_provider", "unknown").fillna("unknown").astype(str)
+            )
+            created = pd.to_datetime(frame.get("created_at"), errors="coerce", utc=True)
+            frame["created_day"] = created.dt.strftime("%Y-%m-%d").fillna("unknown")
+
+            category_counts = frame["category"].value_counts().to_dict()
+            sentiment_counts = frame["sentiment"].value_counts().to_dict()
+            importance_counts = frame["importance_label"].value_counts().to_dict()
+            type_counts = frame["memory_type"].value_counts().to_dict()
+            source_counts = frame["source"].value_counts().to_dict()
+            provider_counts = frame["embedding_provider"].value_counts().to_dict()
+            trend_counts = frame["created_day"].value_counts().sort_index().to_dict()
+            most_discussed_topic = next(iter(category_counts), "General")
+            dominant_sentiment = next(iter(sentiment_counts), "Neutral")
+            average_importance = round(float(frame["importance_score"].mean()), 4)
+            high_importance = int((frame["importance_score"] >= 0.75).sum())
+            importance_statistics = {
+                "mean": average_importance,
+                "median": round(float(frame["importance_score"].median()), 4),
+                "min": round(float(frame["importance_score"].min()), 4),
+                "max": round(float(frame["importance_score"].max()), 4),
+                "std": round(float(frame["importance_score"].std(ddof=0)), 4),
+            }
+            sentiment_statistics = {
+                "dominant": dominant_sentiment,
+                "unique_sentiments": int(frame["sentiment"].nunique()),
+            }
+        except Exception as exc:
+            logger.warning("Pandas analytics failed; using Counter fallback: %s", exc)
+            category_counts = Counter(str(item.get("category") or "General") for item in memories)
+            sentiment_counts = Counter(str(item.get("sentiment") or "Neutral") for item in memories)
+            importance_counts = Counter(str(item.get("importance_label") or "Medium") for item in memories)
+            type_counts = Counter(str(item.get("memory_type") or "semantic") for item in memories)
+            source_counts = Counter(str(item.get("source") or "memory") for item in memories)
+            provider_counts = Counter(str(item.get("embedding_provider") or "unknown") for item in memories)
+            trend_counts = Counter(str(item.get("created_at") or "unknown")[:10] for item in memories)
+            most_discussed_topic = category_counts.most_common(1)[0][0] if category_counts else "General"
+            dominant_sentiment = sentiment_counts.most_common(1)[0][0] if sentiment_counts else "Neutral"
+            high_importance = sum(
+                1 for item in memories if float(item.get("importance_score", 0.0) or 0.0) >= 0.75
+            )
+            average_importance = round(
+                sum(float(item.get("importance_score", 0.0) or 0.0) for item in memories)
+                / max(1, len(memories)),
+                4,
+            )
+            scores = [float(item.get("importance_score", 0.0) or 0.0) for item in memories]
+            importance_statistics = {
+                "mean": average_importance,
+                "median": round(sorted(scores)[len(scores) // 2], 4) if scores else 0.0,
+                "min": round(min(scores), 4) if scores else 0.0,
+                "max": round(max(scores), 4) if scores else 0.0,
+                "std": 0.0,
+            }
+            sentiment_statistics = {
+                "dominant": dominant_sentiment,
+                "unique_sentiments": len(sentiment_counts),
+            }
+        return {
+            "success": True,
+            "user_id": user_id,
+            "total_memories": len(memories),
+            "high_importance_memories": high_importance,
+            "most_discussed_topic": most_discussed_topic,
+            "dominant_sentiment": dominant_sentiment,
+            "category_distribution": dict(category_counts),
+            "sentiment_distribution": dict(sentiment_counts),
+            "importance_distribution": dict(importance_counts),
+            "memory_type_distribution": dict(type_counts),
+            "average_importance": average_importance,
+            "topic_distribution": dict(category_counts),
+            "source_distribution": dict(source_counts),
+            "embedding_provider_distribution": dict(provider_counts),
+            "memory_trends": dict(trend_counts),
+            "importance_statistics": importance_statistics,
+            "sentiment_statistics": sentiment_statistics,
+            "ai_pipeline": "pandas_numpy_analytics",
         }
 
     def _store_memory_result(
@@ -584,13 +756,53 @@ class MemoryManager:
             return existing["id"], False
 
         final_id = memory_id or f"mem_{uuid.uuid4().hex}"
+        start = time.time()
+        metadata_payload = dict(metadata or {})
+        legacy_category = (
+            metadata_payload.get("memory_category")
+            or metadata_payload.get("legacy_category")
+            or metadata_payload.get("category")
+            or ("conversation" if memory_type == "episodic" else memory_type)
+        )
+        legacy_category = str(legacy_category).strip().lower() or "general"
+        metadata_payload.setdefault("memory_category", legacy_category)
+        metadata_payload.setdefault("legacy_category", legacy_category)
+
+        try:
+            prior_memories = self.storage.list_memories(user_id=user_id, limit=80)
+        except Exception:
+            prior_memories = []
+        intelligence = self.intelligence.analyze(
+            clean_content,
+            memory_type=memory_type,
+            base_importance=importance,
+            metadata=metadata_payload,
+            prior_memories=prior_memories,
+        )
+        metadata_payload["ai_category"] = intelligence.category
+        metadata_payload["sentiment"] = intelligence.sentiment
+        metadata_payload["importance_label"] = intelligence.importance_label
+        metadata_payload["intelligence_signals"] = intelligence.signals
+        metadata_payload["topic_confidence"] = intelligence.signals.get("topic_confidence", 0.0)
+        metadata_payload["sentiment_confidence"] = intelligence.signals.get("sentiment_confidence", 0.0)
+        metadata_payload["sentiment_polarity"] = intelligence.signals.get("sentiment_polarity", 0.0)
+        metadata_payload["importance_features"] = {
+            key.removeprefix("importance_"): value
+            for key, value in intelligence.signals.items()
+            if key.startswith("importance_")
+        }
+        metadata_payload["intelligence_provider"] = intelligence.signals.get(
+            "intelligence_provider",
+            "semantic_prototypes+logistic_importance",
+        )
+
         try:
             embedded = self.embedding_service.embed(
                 clean_content,
                 task_type="retrieval_document",
             )
         except Exception as exc:
-            logger.exception("Memory embedding failed")
+            logger.exception("Memory embedding failed for id=%s", final_id)
             raise RuntimeError(f"Memory embedding failed: {exc}") from exc
         updated_at = utc_now()
         if created_at and existing is None:
@@ -601,39 +813,78 @@ class MemoryManager:
             memory_type=memory_type,
             content=clean_content,
             summary=summary or clean_content,
-            importance=importance,
+            importance=intelligence.importance_score,
             source=source,
-            metadata=metadata or {},
+            metadata=metadata_payload,
             embedding=embedded.vector,
             embedding_provider=embedded.provider,
+            importance_score=intelligence.importance_score,
+            importance_label=intelligence.importance_label,
+            category=intelligence.category,
+            sentiment=intelligence.sentiment,
             created_at=created_at,
             updated_at=updated_at,
         )
         self.retriever.add_or_update_memory(final_id)
+        elapsed = round(time.time() - start, 3)
+        logger.info(
+            "_store_memory: id=%s type=%s provider=%s is_new=%s (%.3fs)",
+            final_id, memory_type, embedded.provider, not replaced, elapsed,
+        )
         return final_id, not replaced
 
     def _memory_card(self, memory: dict[str, Any]) -> dict[str, Any]:
         metadata = memory.get("metadata") if isinstance(memory.get("metadata"), dict) else {}
+        legacy_category = (
+            memory.get("memory_category")
+            or metadata.get("memory_category")
+            or metadata.get("legacy_category")
+            or metadata.get("category")
+            or memory.get("category")
+            or "general"
+        )
+        ai_category = (
+            memory.get("ai_category")
+            or metadata.get("ai_category")
+            or "General"
+        )
+        importance_score = float(
+            memory.get("importance_score", memory.get("importance", 0.0)) or 0.0
+        )
         return {
             "id": memory["id"],
             "user_id": memory.get("user_id"),
             "content": memory.get("content", ""),
             "summary": memory.get("summary") or memory.get("content", ""),
             "memory_type": memory.get("memory_type"),
-            "category": memory.get("category") or metadata.get("category") or "general",
+            "category": ai_category,
+            "memory_category": legacy_category,
             "bucket": self._memory_bucket(memory),
-            "importance": memory.get("importance", 0.0),
+            "importance": importance_score,
+            "importance_score": importance_score,
+            "importance_label": memory.get("importance_label")
+            or metadata.get("importance_label")
+            or importance_label_for_score(importance_score),
+            "sentiment": memory.get("sentiment") or metadata.get("sentiment") or "Neutral",
             "pinned": bool(metadata.get("pinned")),
             "source": memory.get("source"),
             "created_at": memory.get("created_at"),
             "updated_at": memory.get("updated_at"),
             "last_accessed_at": memory.get("last_accessed_at"),
             "relevance_score": memory.get("relevance_score"),
+            "topic_confidence": metadata.get("topic_confidence"),
+            "sentiment_confidence": metadata.get("sentiment_confidence"),
+            "embedding_provider": memory.get("embedding_provider"),
+            "vector_backend": memory.get("vector_backend") or self.vector_backend,
         }
 
     def _memory_bucket(self, memory: dict[str, Any]) -> str:
         memory_type = str(memory.get("memory_type", "")).lower()
-        category = str(memory.get("category", "")).lower()
+        category = str(
+            memory.get("memory_category")
+            or memory.get("category")
+            or ""
+        ).lower()
         if memory_type == "episodic":
             return "conversations"
         if category == "preference" or memory_type == "preference":
@@ -665,10 +916,13 @@ class MemoryManager:
         messages: list[dict[str, Any]],
         use_llm: bool,
     ) -> int:
+        start = time.time()
         extracted: list[ExtractedMemory] = self.fact_extractor.extract(messages)
+        logger.debug("Local extraction found %d candidates for user=%s", len(extracted), user_id)
         if use_llm:
             try:
-                for item in self.llm_service.extract_memories(messages):
+                llm_items = self.llm_service.extract_memories(messages)
+                for item in llm_items:
                     category = item["category"]
                     extracted.append(
                         ExtractedMemory(
@@ -681,6 +935,7 @@ class MemoryManager:
                             source="llm_extractor",
                         )
                     )
+                logger.debug("LLM extraction found %d additional candidates", len(llm_items))
             except Exception as exc:
                 logger.warning("LLM extraction failed; continuing with local memories: %s", exc)
 
@@ -701,6 +956,11 @@ class MemoryManager:
                     stored += 1
             except Exception as exc:
                 logger.warning("Skipping extracted memory because storage failed: %s", exc)
+        elapsed = round(time.time() - start, 3)
+        logger.info(
+            "_extract_and_store: user=%s extracted=%d stored=%d llm=%s (%.3fs)",
+            user_id, len(extracted), stored, use_llm, elapsed,
+        )
         return stored
 
     def _upsert_episode_from_messages(
@@ -763,13 +1023,37 @@ class MemoryManager:
         context: str,
         recent_messages: list[dict[str, Any]],
     ) -> str:
-        # The prompt never exposes implementation details; memories are used as
-        # personalization hints for the current answer.
         history = "\n".join(
             f"{message['role'].upper()}: {message['content']}"
             for message in recent_messages[-8:]
         )
-        return f"""
+        try:
+            from langchain_core.prompts import PromptTemplate
+
+            template = PromptTemplate.from_template(
+                """
+You are UniMind, a helpful personalized AI assistant.
+Use the memory context naturally. Do not mention internal memory systems.
+
+MEMORY CONTEXT:
+{context}
+
+RECENT CONVERSATION:
+{history}
+
+CURRENT USER MESSAGE:
+{user_message}
+
+Answer clearly and helpfully:
+""".strip()
+            )
+            return template.format(
+                context=context or "No relevant memories yet.",
+                history=history,
+                user_message=user_message,
+            )
+        except Exception:
+            return f"""
 You are UniMind, a helpful personalized AI assistant.
 Use the memory context naturally. Do not mention internal memory systems.
 
@@ -887,7 +1171,17 @@ Answer clearly and helpfully:
             logger.warning("Could not migrate %s: %s", path, exc)
             return None
 
-    def apply_memory_decay(self, user_id: str | None = None) -> int:
+    def apply_memory_decay(self, user_id: str | None = None, *, force: bool = False) -> int:
+        key = user_id or "__all__"
+        now_monotonic = time.monotonic()
+        if not force and self._decay_ttl_seconds > 0:
+            with self._decay_lock:
+                last_applied = self._decay_last_applied.get(key, 0.0)
+                if now_monotonic - last_applied < self._decay_ttl_seconds:
+                    return 0
+                self._decay_last_applied[key] = now_monotonic
+
+        start = time.time()
         changed = 0
         now = datetime.now(timezone.utc)
         for memory in self.storage.list_memories(user_id=user_id):
@@ -895,6 +1189,12 @@ Answer clearly and helpfully:
             if abs(new_importance - float(memory["importance"])) >= 0.01:
                 self.storage.update_importance(memory["id"], new_importance)
                 changed += 1
+        logger.info(
+            "memory_decay user=%s changed=%d latency_ms=%.1f",
+            user_id or "all",
+            changed,
+            (time.time() - start) * 1000,
+        )
         return changed
 
     def _extract_recurring_topics(

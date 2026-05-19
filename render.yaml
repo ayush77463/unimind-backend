@@ -3,8 +3,31 @@ services:
     name: unimind-api
     runtime: python
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn main:app --workers 1 --worker-class uvicorn.workers.UvicornWorker --bind 0.0.0.0:$PORT --timeout 120
+    startCommand: gunicorn main:app --workers $WEB_CONCURRENCY --worker-class uvicorn.workers.UvicornWorker --bind 0.0.0.0:$PORT --timeout 120
+    healthCheckPath: /health
     envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: WEB_CONCURRENCY
+        value: "1"
+      - key: LOG_LEVEL
+        value: INFO
+      - key: UNIMIND_API_TIMEOUT_SECONDS
+        value: "20"
+      - key: UNIMIND_EMBED_CACHE_SIZE
+        value: "1024"
+      - key: UNIMIND_DECAY_TTL_SECONDS
+        value: "21600"
+      - key: UNIMIND_VECTOR_BACKEND
+        value: chroma
+      - key: UNIMIND_ENABLE_LOCAL_MODELS
+        value: "0"
+      - key: UNIMIND_EMBEDDING_PROVIDER
+        value: auto
+      - key: UNIMIND_ALLOW_MODEL_DOWNLOADS
+        value: "0"
+      - key: SUPABASE_POOL_MAX
+        value: "3"
       - key: GEMINI_API_KEY
         sync: false
       - key: SUPABASE_DB_HOST
@@ -17,5 +40,3 @@ services:
         value: postgres
       - key: SUPABASE_DB_PASSWORD
         sync: false
-      - key: PYTHON_VERSION
-        value: 3.11.9

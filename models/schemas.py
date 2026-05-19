@@ -145,6 +145,27 @@ class MemoryStatusResponse(BaseModel):
     recent_episode_summaries: list[str]
 
 
+class MemoryAnalyticsResponse(BaseModel):
+    success: bool = True
+    user_id: str
+    total_memories: int
+    high_importance_memories: int
+    most_discussed_topic: str
+    dominant_sentiment: str
+    category_distribution: dict[str, int]
+    sentiment_distribution: dict[str, int]
+    importance_distribution: dict[str, int]
+    memory_type_distribution: dict[str, int]
+    average_importance: float
+    topic_distribution: dict[str, int] = Field(default_factory=dict)
+    source_distribution: dict[str, int] = Field(default_factory=dict)
+    embedding_provider_distribution: dict[str, int] = Field(default_factory=dict)
+    memory_trends: dict[str, int] = Field(default_factory=dict)
+    importance_statistics: dict[str, float] = Field(default_factory=dict)
+    sentiment_statistics: dict[str, Any] = Field(default_factory=dict)
+    ai_pipeline: str = "pandas_numpy_analytics"
+
+
 class PinMemoryRequest(RequestModel):
     memory_id: str = Field(..., min_length=1, max_length=160)
     pinned: bool = True

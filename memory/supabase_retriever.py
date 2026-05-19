@@ -62,18 +62,27 @@ class SupabaseRetriever:
         try:
             query_embedding = self.embedding_service.embed(
                 query, task_type="retrieval_query",
-            ).vector
+            )
+            query_vector = query_embedding.vector
+            query_provider = query_embedding.provider
         except Exception as exc:
             logger.exception("Query embedding failed")
             self.last_warnings.append(f"query_embedding_failed: {exc}")
             self.last_debug["candidate_count"] = 0
             return []
 
+        logger.info(
+            "Retrieval search: user=%s query='%.50s' provider=%s top_k=%d",
+            user_id, query, query_provider, top_k,
+        )
+
         try:
             raw_hits = self.storage.vector_search(
-                query_embedding=query_embedding,
+                query_embedding=query_vector,
                 user_id=user_id,
                 top_k=max(top_k * 10, 50),
+                embedding_provider=query_provider,
+                embedding_dim=int(query_vector.shape[0]),
             )
         except Exception as exc:
             logger.warning("PostgreSQL vector search failed: %s", exc)
@@ -82,6 +91,7 @@ class SupabaseRetriever:
             return []
 
         if not raw_hits:
+            logger.info("No vector search results for user=%s", user_id)
             self.last_debug["candidate_count"] = 0
             return []
 
@@ -90,12 +100,40 @@ class SupabaseRetriever:
         dropped: list[dict] = []
         seen_norms: set[str] = set()
         query_tokens = self._tokens(query)
+        provider_mismatches = 0
+        memory_ids = [memory_id for memory_id, _ in raw_hits]
+        try:
+            hydrated = self.storage.get_memories_by_ids(memory_ids)
+        except Exception as exc:
+            logger.warning("Batch memory hydration failed; falling back to per-row fetches: %s", exc)
+            self.last_warnings.append(f"batch_hydration_failed: {exc}")
+            hydrated = {}
 
         for memory_id, raw_score in raw_hits:
-            memory = self.storage.get_memory(memory_id)
+            memory = hydrated.get(memory_id) or self.storage.get_memory(memory_id)
             if memory is None or memory["user_id"] != user_id:
+                dropped.append(
+                    {
+                        "id": memory_id,
+                        "memory_type": None,
+                        "relevance_score": 0.0,
+                        "evidence_score": 0.0,
+                        "reason": "not_found",
+                    }
+                )
                 continue
             if allowed_types and memory["memory_type"] not in allowed_types:
+                continue
+            # Skip memories with mismatched embedding providers to avoid
+            # comparing vectors of different dimensions/models.
+            mem_provider = memory.get("embedding_provider") or ""
+            if query_provider.startswith("gemini:") and mem_provider == "local_hash":
+                provider_mismatches += 1
+                dropped.append(self._drop_debug(memory, 0.0, 0.0, "embedding_provider_mismatch"))
+                continue
+            if query_provider == "local_hash" and mem_provider.startswith("gemini:"):
+                provider_mismatches += 1
+                dropped.append(self._drop_debug(memory, 0.0, 0.0, "embedding_provider_mismatch"))
                 continue
 
             semantic_score = max(0.0, min(1.0, float(raw_score)))
@@ -144,9 +182,25 @@ class SupabaseRetriever:
         results.sort(key=lambda item: item["relevance_score"], reverse=True)
         selected = results[:top_k]
         self.storage.mark_memories_accessed(item["id"] for item in selected)
+
+        if provider_mismatches > 0:
+            warning = f"provider_mismatch_skipped:{provider_mismatches}"
+            self.last_warnings.append(warning)
+            logger.warning(
+                "Skipped %d memories due to embedding provider mismatch (query=%s)",
+                provider_mismatches, query_provider,
+            )
+
+        logger.info(
+            "Retrieval complete: user=%s candidates=%d selected=%d dropped=%d",
+            user_id, len(results) + len(dropped), len(selected), len(dropped),
+        )
+
         self.last_debug.update({
             "candidate_count": len(results) + len(dropped),
             "selected_count": len(selected),
+            "query_provider": query_provider,
+            "provider_mismatches": provider_mismatches,
             "selected": [
                 {
                     "id": item["id"],

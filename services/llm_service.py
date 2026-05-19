@@ -1,12 +1,13 @@
-"""Minimal Gemini LLM client used by the backend /chat demo endpoint."""
+"""Minimal Langchain LLM client used by the backend /chat demo endpoint."""
 
 from __future__ import annotations
 
 import json
 import logging
 import os
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
-from typing import Iterable
+from typing import Iterable, AsyncGenerator
+
+from pydantic import BaseModel, Field
 
 try:
     from ..config import GEMINI_API_KEY, GEMINI_LLM_MODEL, gemini_enabled
@@ -19,6 +20,16 @@ class LLMUnavailableError(RuntimeError):
 
 
 logger = logging.getLogger(__name__)
+
+
+class ExtractedMemoryItem(BaseModel):
+    content: str = Field(description="One concise sentence representing a durable fact about the user.")
+    category: str = Field(description="Must be one of: personal, preference, skill, goal, location, home, study, work, recurring_topic, general")
+    importance: float = Field(description="Importance score from 0.0 to 1.0", ge=0.0, le=1.0)
+
+
+class MemoryExtractionList(BaseModel):
+    memories: list[ExtractedMemoryItem] = Field(default_factory=list, description="List of durable facts extracted.")
 
 
 class LLMService:
@@ -37,43 +48,42 @@ class LLMService:
         if os.getenv("UNIMIND_DISABLE_GEMINI") == "1" or not gemini_enabled():
             return
         try:
-            import google.generativeai as genai
-
-            genai.configure(api_key=self.api_key)
-            self._model = genai.GenerativeModel(self.model_name)
+            from langchain_google_genai import ChatGoogleGenerativeAI
+            
+            self._model = ChatGoogleGenerativeAI(
+                model=self.model_name,
+                google_api_key=self.api_key,
+                temperature=0.7,
+                max_retries=2,
+                timeout=self.timeout_seconds,
+            )
         except Exception as exc:
-            logger.warning("Gemini LLM setup failed: %s", exc)
+            logger.warning("Langchain LLM setup failed: %s", exc)
             self._model = None
 
     def generate_response(self, prompt: str) -> str:
         if self._model is None:
             raise LLMUnavailableError("Backend Gemini LLM is not configured")
-        response = self._run_with_timeout(
-            lambda: self._model.generate_content(prompt),
-            "Gemini response timed out",
-        )
-        text = getattr(response, "text", "") or ""
-        text = text.strip()
-        if not text:
-            raise RuntimeError("Gemini returned an empty response")
-        return text
+        
+        try:
+            response = self._model.invoke(prompt)
+            text = str(response.content).strip()
+            if not text:
+                raise RuntimeError("LLM returned an empty response")
+            return text
+        except Exception as exc:
+            raise RuntimeError(f"LLM request failed: {exc}")
 
-    def generate_response_stream(self, prompt: str):
+    async def agenerate_response_stream(self, prompt: str) -> AsyncGenerator[str, None]:
         if self._model is None:
             raise LLMUnavailableError("Backend Gemini LLM is not configured")
+        
         try:
-            response = self._model.generate_content(prompt, stream=True)
-            emitted = False
-            for chunk in response:
-                text = getattr(chunk, "text", "") or ""
-                if text:
-                    emitted = True
-                    yield text
-            if not emitted:
-                fallback = self.generate_response(prompt)
-                for part in self._smooth_chunks(fallback):
-                    yield part
-        except TypeError:
+            async for chunk in self._model.astream(prompt):
+                if chunk.content:
+                    yield str(chunk.content)
+        except Exception as exc:
+            logger.warning("Async streaming failed, falling back to sync. Error: %s", exc)
             fallback = self.generate_response(prompt)
             for part in self._smooth_chunks(fallback):
                 yield part
@@ -87,57 +97,28 @@ class LLMService:
         )
         prompt = f"""
 Extract durable memories about the user from this conversation.
-Return only valid JSON as an array. Each item must have:
-- content: one sentence
-- category: personal, preference, skill, goal, location, home, study, work,
-  recurring_topic, or general
-- importance: number from 0.0 to 1.0
-
-Return [] if there are no durable memories.
+Only extract clear facts about the user's life, preferences, skills, goals, locations, or identity.
 
 Conversation:
 {conversation}
 """
         try:
-            text = self.generate_response(prompt)
-            decoded = json.loads(self._strip_json_fence(text))
-            if not isinstance(decoded, list):
-                return []
+            structured_llm = self._model.with_structured_output(MemoryExtractionList)
+            result = structured_llm.invoke(prompt)
+            
             valid = []
-            for item in decoded[:5]:
-                if not isinstance(item, dict):
-                    continue
-                content = str(item.get("content", "")).strip()
+            for item in result.memories:
+                content = item.content.strip()
                 if len(content) < 8:
                     continue
-                category = str(item.get("category", "general")).strip().lower()
-                if category not in {
-                    "personal",
-                    "preference",
-                    "skill",
-                    "goal",
-                    "location",
-                    "home",
-                    "study",
-                    "work",
-                    "recurring_topic",
-                    "general",
-                }:
-                    category = "general"
-                try:
-                    importance = float(item.get("importance", 0.6))
-                except (TypeError, ValueError):
-                    importance = 0.6
-                valid.append(
-                    {
-                        "content": content,
-                        "category": category,
-                        "importance": max(0.0, min(1.0, importance)),
-                    }
-                )
+                valid.append({
+                    "content": content,
+                    "category": item.category,
+                    "importance": item.importance,
+                })
             return valid
         except Exception as exc:
-            logger.warning("LLM memory extraction failed; using local extraction only: %s", exc)
+            logger.warning("Langchain LLM memory extraction failed; using local extraction only: %s", exc)
             return []
 
     def summarize(self, messages: Iterable[dict]) -> str | None:
@@ -161,28 +142,6 @@ Summary:
         except Exception as exc:
             logger.warning("LLM summarization failed; using local summary: %s", exc)
             return None
-
-    def _strip_json_fence(self, value: str) -> str:
-        clean = value.strip()
-        if clean.startswith("```"):
-            lines = clean.splitlines()
-            if lines and lines[0].startswith("```"):
-                lines = lines[1:]
-            if lines and lines[-1].startswith("```"):
-                lines = lines[:-1]
-            clean = "\n".join(lines).strip()
-        return clean
-
-    def _run_with_timeout(self, func, timeout_message: str):
-        executor = ThreadPoolExecutor(max_workers=1)
-        future = executor.submit(func)
-        try:
-            return future.result(timeout=self.timeout_seconds)
-        except FutureTimeoutError as exc:
-            future.cancel()
-            raise TimeoutError(f"{timeout_message} after {self.timeout_seconds:.1f}s") from exc
-        finally:
-            executor.shutdown(wait=False, cancel_futures=True)
 
     def _smooth_chunks(self, text: str, chunk_size: int = 28):
         words = text.split(" ")

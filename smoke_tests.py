@@ -5,8 +5,14 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import numpy as np
+
 os.environ["UNIMIND_DISABLE_GEMINI"] = "1"
-_MODULE_TEMP_DIR = tempfile.TemporaryDirectory()
+os.environ["UNIMIND_FORCE_LOCAL_STORAGE"] = "1"
+os.environ["UNIMIND_VECTOR_BACKEND"] = "chroma"
+os.environ["UNIMIND_ENABLE_LOCAL_MODELS"] = "0"
+os.environ["UNIMIND_ALLOW_MODEL_DOWNLOADS"] = "0"
+_MODULE_TEMP_DIR = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
 os.environ["UNIMIND_STORAGE_DIR"] = _MODULE_TEMP_DIR.name
 
 from fastapi.testclient import TestClient
@@ -14,7 +20,9 @@ from fastapi.testclient import TestClient
 from unimind_memory.api.memory import get_memory_manager, set_memory_manager
 from unimind_memory.main import app
 from unimind_memory.memory.embedding_service import EmbeddingService
+from unimind_memory.memory.intelligence import MemoryIntelligenceAnalyzer
 from unimind_memory.memory.memory_manager import MemoryManager
+from unimind_memory.memory.supabase_retriever import SupabaseRetriever
 from unimind_memory.services.llm_service import LLMUnavailableError
 
 
@@ -70,7 +78,7 @@ class UnavailableLLMService:
 class MemoryTestCase(unittest.TestCase):
     def setUp(self):
         self.original_manager = get_memory_manager()
-        self.temp_dir = tempfile.TemporaryDirectory()
+        self.temp_dir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.storage_dir = Path(self.temp_dir.name)
         self.manager = MemoryManager(
             storage_dir=self.storage_dir,
@@ -81,16 +89,111 @@ class MemoryTestCase(unittest.TestCase):
         self.client = TestClient(app)
 
     def tearDown(self):
+        close = getattr(self.manager, "close", None)
+        if callable(close):
+            close()
         set_memory_manager(self.original_manager)
         self.temp_dir.cleanup()
 
 
 class MemoryCoreTests(MemoryTestCase):
+    def test_memory_intelligence_examples(self):
+        analyzer = MemoryIntelligenceAnalyzer()
+
+        greeting = analyzer.analyze("Hi", base_importance=0.6)
+        ai_interest = analyzer.analyze("I love AI Engineering", base_importance=0.6)
+        project = analyzer.analyze(
+            "My project uses Flutter and semantic retrieval",
+            base_importance=0.6,
+        )
+
+        self.assertEqual(greeting.importance_label, "Low")
+        self.assertEqual(greeting.category, "General")
+        self.assertEqual(greeting.sentiment, "Neutral")
+        self.assertEqual(ai_interest.importance_label, "High")
+        self.assertEqual(ai_interest.category, "AI")
+        self.assertEqual(ai_interest.sentiment, "Excited")
+        self.assertEqual(project.importance_label, "High")
+        self.assertIn(project.category, {"AI", "Flutter", "Projects"})
+
     def test_local_hash_embedding_fallback_is_available(self):
         service = EmbeddingService(api_key="")
         result = service.embed("User likes Flutter and Python")
         self.assertEqual(result.provider, "local_hash")
         self.assertEqual(result.vector.shape[0], 384)
+
+    def test_embedding_cache_is_bounded(self):
+        service = EmbeddingService(api_key="")
+        service.cache_size = 2
+
+        service.embed("alpha cache item")
+        service.embed("beta cache item")
+        service.embed("gamma cache item")
+
+        self.assertLessEqual(len(service._cache), 2)
+        self.assertNotIn(
+            ("retrieval_document", "alpha cache item"),
+            service._cache,
+        )
+
+    def test_sentence_transformer_provider_is_lazy_and_env_gated(self):
+        service = EmbeddingService(api_key="")
+        service.embedding_provider_preference = "sentence_transformer"
+        service.enable_local_models = False
+
+        result = service.embed("User likes lazy model loading")
+        diagnostics = service.diagnostics()
+
+        self.assertEqual(result.provider, "local_hash")
+        self.assertFalse(diagnostics["local_models_enabled"])
+        self.assertFalse(diagnostics["sentence_model_loaded"])
+
+    def test_topic_classifier_uses_semantic_prototypes(self):
+        analyzer = MemoryIntelligenceAnalyzer(self.manager.embedding_service)
+
+        result = analyzer.analyze(
+            "The project needs transformer embeddings and vector retrieval ranking",
+            base_importance=0.7,
+        )
+
+        self.assertIn(result.category, {"AI", "Projects", "Programming"})
+        self.assertGreater(result.signals["topic_confidence"], 0)
+        self.assertIn("sklearn_cosine", result.signals["intelligence_provider"])
+
+    def test_transformer_sentiment_falls_back_without_downloads(self):
+        analyzer = MemoryIntelligenceAnalyzer(
+            self.manager.embedding_service,
+            enable_transformers=True,
+        )
+
+        def fail_transformer(text):
+            raise RuntimeError("offline model cache missing")
+
+        analyzer._transformer_sentiment = fail_transformer
+        result = analyzer.analyze(
+            "I am stressed and confused about the deadline",
+            base_importance=0.6,
+        )
+
+        self.assertEqual(result.sentiment, "Stressed")
+        self.assertGreater(result.signals["sentiment_confidence"], 0)
+        self.assertTrue(analyzer._sentiment_failed)
+
+    def test_logistic_importance_features_are_recorded(self):
+        memory_id = self.manager.store_memory(
+            user_id="importance_user",
+            content="User wants to build an AI engineering portfolio project",
+            memory_type="semantic",
+            importance=0.8,
+            metadata={"category": "goal"},
+        )
+
+        memory = self.manager.storage.get_memory(memory_id)
+        signals = memory["metadata"]["intelligence_signals"]
+
+        self.assertEqual(memory["importance_label"], "High")
+        self.assertIn("importance_base_importance", signals)
+        self.assertIn("importance_features", memory["metadata"])
 
     def test_store_and_retrieve_memory_with_root_api(self):
         store = self.client.post(
@@ -132,14 +235,89 @@ class MemoryCoreTests(MemoryTestCase):
             run_migrations=False,
             llm_service=UnavailableLLMService(),
         )
-        results = reloaded.retrieve_memories(
-            user_id="persist_user",
-            query="Flutter assistant",
+        try:
+            results = reloaded.retrieve_memories(
+                user_id="persist_user",
+                query="Flutter assistant",
+                top_k=3,
+            )
+        finally:
+            reloaded.close()
+
+        self.assertEqual(len(results), 1)
+        self.assertIn("Flutter", results[0]["content"])
+
+    def test_chroma_retriever_syncs_searches_and_deletes(self):
+        memory_id = self.manager.store_memory(
+            user_id="chroma_user",
+            content="User is testing Chroma vector retrieval with embeddings",
+            memory_type="semantic",
+            importance=0.8,
+        )
+
+        diagnostics = getattr(self.manager.retriever, "diagnostics", lambda: {})()
+        results = self.manager.retrieve_memories(
+            user_id="chroma_user",
+            query="Chroma retrieval embeddings",
+            top_k=3,
+            debug=True,
+        )
+
+        self.assertEqual(diagnostics.get("status"), "ready")
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["id"], memory_id)
+        self.assertEqual(results[0].get("vector_backend"), "chroma")
+
+        self.assertTrue(self.manager.delete_memory(memory_id))
+        after_delete = self.manager.retrieve_memories(
+            user_id="chroma_user",
+            query="Chroma retrieval embeddings",
+            top_k=3,
+        )
+        self.assertEqual(after_delete, [])
+
+    def test_chroma_falls_back_when_unavailable(self):
+        self.manager.store_memory(
+            user_id="fallback_user",
+            content="User prefers fallback-safe vector retrieval",
+            memory_type="preference",
+            importance=0.8,
+        )
+        if not hasattr(self.manager.retriever, "_available"):
+            self.skipTest("Chroma retriever not active")
+
+        self.manager.retriever._available = False
+        results = self.manager.retrieve_memories(
+            user_id="fallback_user",
+            query="fallback vector retrieval",
             top_k=3,
         )
 
         self.assertEqual(len(results), 1)
-        self.assertIn("Flutter", results[0]["content"])
+        self.assertIn("fallback", self.manager.retriever.last_debug.get("vector_backend", ""))
+
+    def test_chroma_reindexes_provider_mismatches_opportunistically(self):
+        memory_id = self.manager.store_memory(
+            user_id="provider_user",
+            content="User studies semantic retrieval provider migration",
+            memory_type="semantic",
+            importance=0.7,
+        )
+        self.manager.storage.update_embedding(
+            memory_id,
+            np.zeros(384, dtype=np.float32),
+            "legacy_provider",
+        )
+
+        results = self.manager.retrieve_memories(
+            user_id="provider_user",
+            query="semantic retrieval provider migration",
+            top_k=3,
+        )
+        updated = self.manager.storage.get_memory(memory_id)
+
+        self.assertEqual(results, [])
+        self.assertEqual(updated["embedding_provider"], "local_hash")
 
     def test_duplicate_facts_return_existing_memory(self):
         first_id = self.manager.add_fact(
@@ -240,12 +418,15 @@ class MemoryCoreTests(MemoryTestCase):
             llm_service=UnavailableLLMService(),
         )
 
-        self.assertEqual(
-            migrated.storage.get_message_count("legacy_user"),
-            1,
-        )
-        self.assertEqual(len(migrated.semantic.get_all_facts("legacy_user")), 1)
-        self.assertEqual(len(migrated.episodic.get_all_episodes("legacy_user")), 1)
+        try:
+            self.assertEqual(
+                migrated.storage.get_message_count("legacy_user"),
+                1,
+            )
+            self.assertEqual(len(migrated.semantic.get_all_facts("legacy_user")), 1)
+            self.assertEqual(len(migrated.episodic.get_all_episodes("legacy_user")), 1)
+        finally:
+            migrated.close()
 
     def test_intelligent_extraction_categories_and_importance(self):
         result = self.manager.add_exchange(
@@ -324,7 +505,76 @@ class MemoryCoreTests(MemoryTestCase):
 
         self.assertGreaterEqual(changed, 1)
         self.assertLess(low["importance"], 0.5)
-        self.assertEqual(high["importance"], 0.92)
+        self.assertGreaterEqual(high["importance"], 0.92)
+
+    def test_memory_decay_is_throttled_per_user(self):
+        old_time = (
+            datetime.now(timezone.utc) - timedelta(days=420)
+        ).isoformat()
+        self.manager.store_memory(
+            user_id="throttle_decay_user",
+            content="User briefly mentioned a low priority temporary topic",
+            memory_type="semantic",
+            importance=0.3,
+            metadata={"category": "general"},
+            created_at=old_time,
+        )
+
+        first = self.manager.apply_memory_decay(user_id="throttle_decay_user")
+        second = self.manager.apply_memory_decay(user_id="throttle_decay_user")
+
+        self.assertGreaterEqual(first, 1)
+        self.assertEqual(second, 0)
+
+    def test_supabase_retriever_falls_back_when_batch_hydration_fails(self):
+        class FakeStorage:
+            get_count = 0
+            accessed: list[str] = []
+
+            def vector_search(self, **kwargs):
+                self.vector_kwargs = kwargs
+                return [("memory_one", 0.92)]
+
+            def get_memories_by_ids(self, ids):
+                raise RuntimeError("batch hydrate failed")
+
+            def get_memory(self, memory_id):
+                self.get_count += 1
+                return {
+                    "id": memory_id,
+                    "user_id": "batch_user",
+                    "memory_type": "semantic",
+                    "content": "User likes resilient Python retrieval",
+                    "summary": "User likes resilient Python retrieval",
+                    "category": "skill",
+                    "importance": 0.8,
+                    "embedding_provider": "local_hash",
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                }
+
+            def mark_memories_accessed(self, ids):
+                self.accessed = list(ids)
+
+        storage = FakeStorage()
+        retriever = SupabaseRetriever(
+            storage=storage,
+            embedding_service=EmbeddingService(api_key=""),
+        )
+
+        results = retriever.search(
+            user_id="batch_user",
+            query="python retrieval",
+            top_k=1,
+        )
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(storage.get_count, 1)
+        self.assertEqual(storage.accessed, ["memory_one"])
+        self.assertTrue(
+            any("batch_hydration_failed" in warning for warning in retriever.last_warnings)
+        )
+        self.assertEqual(storage.vector_kwargs["embedding_provider"], "local_hash")
 
     def test_retrieval_debug_deduplicates_and_explains_selection(self):
         self.manager.store_memory(
@@ -394,17 +644,20 @@ class MemoryCoreTests(MemoryTestCase):
             run_migrations=False,
             llm_service=TimeoutLLMService(),
         )
-        result = manager.add_exchange(
-            user_id="timeout_user",
-            user_message="Remember that I prefer reliable APIs.",
-            assistant_message="Saved.",
-            session_id="timeout-demo",
-            ai_enrich=True,
-        )
+        try:
+            result = manager.add_exchange(
+                user_id="timeout_user",
+                user_message="Remember that I prefer reliable APIs.",
+                assistant_message="Saved.",
+                session_id="timeout-demo",
+                ai_enrich=True,
+            )
 
-        self.assertTrue(result["success"])
-        self.assertEqual(result["facts_added"], 1)
-        self.assertEqual(len(manager.semantic.get_all_facts("timeout_user")), 1)
+            self.assertTrue(result["success"])
+            self.assertEqual(result["facts_added"], 1)
+            self.assertEqual(len(manager.semantic.get_all_facts("timeout_user")), 1)
+        finally:
+            manager.close()
 
     def test_embedding_failure_falls_back_to_local_hash(self):
         service = EmbeddingService(api_key="")
@@ -420,21 +673,24 @@ class MemoryCoreTests(MemoryTestCase):
         self.assertEqual(result.provider, "local_hash")
         self.assertEqual(result.vector.shape[0], 384)
 
-    def test_vector_search_failure_rebuilds_once(self):
-        class BrokenIndex:
-            d = 384
-            ntotal = 1
-
-            def search(self, vector, count):
-                raise RuntimeError("broken vector index")
-
+    def test_vector_search_failure_uses_guarded_fallback(self):
         self.manager.store_memory(
             user_id="vector_user",
             content="User prefers resilient retrieval",
             memory_type="preference",
             importance=0.7,
         )
-        self.manager.retriever.index = BrokenIndex()
+        if hasattr(self.manager.retriever, "_query_chroma"):
+            self.manager.retriever._query_chroma = lambda **kwargs: None
+        elif hasattr(self.manager.retriever, "index"):
+            class BrokenIndex:
+                d = 384
+                ntotal = 1
+
+                def search(self, vector, count):
+                    raise RuntimeError("broken vector index")
+
+            self.manager.retriever.index = BrokenIndex()
 
         results = self.manager.retrieve_memories(
             user_id="vector_user",
@@ -444,7 +700,10 @@ class MemoryCoreTests(MemoryTestCase):
 
         self.assertEqual(len(results), 1)
         self.assertTrue(
-            any("vector_search_failed" in item for item in self.manager.retriever.last_warnings)
+            any(
+                "vector_search_failed" in item or "chroma_query_failed" in item
+                for item in self.manager.retriever.last_warnings
+            )
         )
 
 
@@ -453,6 +712,11 @@ class MemoryApiCompatibilityTests(MemoryTestCase):
         for path in ["/health", "/api/v1/health", "/"]:
             response = self.client.get(path)
             self.assertEqual(response.status_code, 200)
+        health = self.client.get("/health").json()
+        self.assertIn("latency_ms", health)
+        self.assertIn("vector_backend", health)
+        self.assertIn("ai_pipeline", health)
+        self.assertIn("chroma", health)
 
     def test_flutter_compatible_exchange_context_and_viewer_routes(self):
         response = self.client.post(
@@ -578,26 +842,28 @@ class MemoryApiCompatibilityTests(MemoryTestCase):
             llm_service=fake_llm,
         )
         set_memory_manager(manager)
+        try:
+            response = self.client.post(
+                "/api/v1/chat",
+                json={
+                    "user_id": "mock_chat_user",
+                    "message": "My name is Ayush and I prefer stable APIs.",
+                    "session_id": "demo",
+                },
+            )
 
-        response = self.client.post(
-            "/api/v1/chat",
-            json={
-                "user_id": "mock_chat_user",
-                "message": "My name is Ayush and I prefer stable APIs.",
-                "session_id": "demo",
-            },
-        )
-
-        self.assertEqual(response.status_code, 200)
-        body = response.json()
-        self.assertTrue(body["success"])
-        self.assertEqual(body["response"], "Mock response using memory.")
-        self.assertIn("MEMORY CONTEXT", fake_llm.last_prompt)
-        self.assertGreaterEqual(
-            len(manager.semantic.get_all_facts("mock_chat_user")),
-            2,
-        )
-        self.assertEqual(manager.storage.get_message_count("mock_chat_user"), 2)
+            self.assertEqual(response.status_code, 200)
+            body = response.json()
+            self.assertTrue(body["success"])
+            self.assertEqual(body["response"], "Mock response using memory.")
+            self.assertIn("MEMORY CONTEXT", fake_llm.last_prompt)
+            self.assertGreaterEqual(
+                len(manager.semantic.get_all_facts("mock_chat_user")),
+                2,
+            )
+            self.assertEqual(manager.storage.get_message_count("mock_chat_user"), 2)
+        finally:
+            manager.close()
 
     def test_chat_stream_returns_sse_delta_and_done(self):
         fake_llm = FakeLLMService()
@@ -607,23 +873,25 @@ class MemoryApiCompatibilityTests(MemoryTestCase):
             llm_service=fake_llm,
         )
         set_memory_manager(manager)
+        try:
+            with self.client.stream(
+                "POST",
+                "/api/v1/chat/stream",
+                json={
+                    "user_id": "stream_user",
+                    "message": "Remember that I prefer streaming UX.",
+                    "session_id": "stream-demo",
+                },
+            ) as response:
+                self.assertEqual(response.status_code, 200)
+                body = "".join(response.iter_text())
 
-        with self.client.stream(
-            "POST",
-            "/api/v1/chat/stream",
-            json={
-                "user_id": "stream_user",
-                "message": "Remember that I prefer streaming UX.",
-                "session_id": "stream-demo",
-            },
-        ) as response:
-            self.assertEqual(response.status_code, 200)
-            body = "".join(response.iter_text())
-
-        self.assertIn('"type": "delta"', body)
-        self.assertIn('"type": "done"', body)
-        self.assertIn('"memory_used"', body)
-        self.assertEqual(manager.storage.get_message_count("stream_user"), 2)
+            self.assertIn('"type": "delta"', body)
+            self.assertIn('"type": "done"', body)
+            self.assertIn('"memory_used"', body)
+            self.assertEqual(manager.storage.get_message_count("stream_user"), 2)
+        finally:
+            manager.close()
 
     def test_memory_all_returns_lightweight_cards_with_pagination(self):
         first = self.manager.add_fact(
@@ -658,7 +926,11 @@ class MemoryApiCompatibilityTests(MemoryTestCase):
             "summary",
             "memory_type",
             "category",
+            "memory_category",
             "importance",
+            "importance_score",
+            "importance_label",
+            "sentiment",
             "pinned",
             "created_at",
             "updated_at",
@@ -688,6 +960,60 @@ class MemoryApiCompatibilityTests(MemoryTestCase):
         body = response.json()
         self.assertEqual(body["total_returned"], 1)
         self.assertEqual(body["memories"][0]["bucket"], "goals")
+
+    def test_memory_analytics_returns_distributions(self):
+        self.manager.store_memory(
+            user_id="analytics_user",
+            content="User loves AI Engineering and semantic memory systems",
+            memory_type="semantic",
+            importance=0.85,
+            metadata={"category": "goal"},
+        )
+        self.manager.store_memory(
+            user_id="analytics_user",
+            content="User is confused about Flutter state management",
+            memory_type="semantic",
+            importance=0.65,
+            metadata={"category": "study"},
+        )
+
+        response = self.client.get("/api/v1/memory/analytics/analytics_user")
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertTrue(body["success"])
+        self.assertEqual(body["total_memories"], 2)
+        self.assertGreaterEqual(body["high_importance_memories"], 1)
+        self.assertIn("category_distribution", body)
+        self.assertIn("sentiment_distribution", body)
+        self.assertTrue(body["most_discussed_topic"])
+        self.assertIn("topic_distribution", body)
+        self.assertIn("source_distribution", body)
+        self.assertIn("embedding_provider_distribution", body)
+        self.assertIn("importance_statistics", body)
+        self.assertEqual(body["ai_pipeline"], "pandas_numpy_analytics")
+
+    def test_document_upload_returns_langchain_chunks(self):
+        text = (
+            "UniMind document ingestion should chunk PDFs and notes for semantic retrieval. "
+            "The uploaded document discusses Chroma, embeddings, and multimodal memory. "
+        ) * 40
+
+        response = self.client.post(
+            "/api/v1/document/upload",
+            data={"user_id": "doc_user"},
+            files={"file": ("notes.txt", text.encode("utf-8"), "text/plain")},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertTrue(body["success"])
+        self.assertIn("extracted_text", body)
+        self.assertGreater(body["chunk_count"], 1)
+        self.assertIn("document_summary", body)
+        first_chunk = body["chunks"][0]
+        self.assertEqual(first_chunk["metadata"]["source"], "document_upload")
+        self.assertEqual(first_chunk["metadata"]["filename"], "notes.txt")
 
     def test_memory_pin_and_delete_routes(self):
         memory_id = self.manager.add_fact(

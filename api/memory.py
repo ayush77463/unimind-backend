@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import logging
+import threading
+import time
 from typing import Annotated
 
 from fastapi import APIRouter, HTTPException, Query
@@ -14,6 +17,7 @@ try:
         AddFactRequest,
         AddMessageRequest,
         FactResponse,
+        MemoryAnalyticsResponse,
         MemoryRetrieveResponse,
         MemoryStatusResponse,
         MemoryStoreRequest,
@@ -30,6 +34,7 @@ except ImportError:  # pragma: no cover
         AddFactRequest,
         AddMessageRequest,
         FactResponse,
+        MemoryAnalyticsResponse,
         MemoryRetrieveResponse,
         MemoryStatusResponse,
         MemoryStoreRequest,
@@ -42,21 +47,30 @@ except ImportError:  # pragma: no cover
 
 router = APIRouter(tags=["Memory"])
 memory_manager: MemoryManager | None = None
+_memory_manager_lock = threading.Lock()
+logger = logging.getLogger("unimind.api")
 
 
 def set_memory_manager(manager: MemoryManager) -> None:
     global memory_manager
-    memory_manager = manager
+    with _memory_manager_lock:
+        memory_manager = manager
+    logger.info("MemoryManager set via startup (supabase=%s)", manager._using_supabase)
 
 
 def get_memory_manager() -> MemoryManager:
     global memory_manager
     if memory_manager is None:
-        import logging
-        logger = logging.getLogger(__name__)
-        logger.info("Lazy-initializing MemoryManager on first request...")
-        memory_manager = MemoryManager()
-        logger.info("MemoryManager ready (supabase=%s)", memory_manager._using_supabase)
+        with _memory_manager_lock:
+            if memory_manager is None:
+                logger.warning("Lazy-initializing MemoryManager (startup init may have failed)...")
+                start = time.time()
+                memory_manager = MemoryManager()
+                elapsed = round(time.time() - start, 2)
+                logger.info(
+                    "MemoryManager lazy-init complete in %.2fs (supabase=%s)",
+                    elapsed, memory_manager._using_supabase,
+                )
     return memory_manager
 
 
@@ -69,31 +83,62 @@ def _error(message: str, status_code: int = 500) -> JSONResponse:
 
 @router.get("/health")
 async def health_check():
+    start = time.time()
     try:
         manager = get_memory_manager()
-        return {
+        response = {
             "success": True,
             "status": "healthy",
             "service": "UniMind Memory API",
-            "version": "2.1.0",
+            "version": "2.2.0",
             "storage": "supabase_postgresql" if manager._using_supabase else "sqlite",
-            "vector_store": "postgresql" if manager._using_supabase else "faiss",
+            "vector_store": manager.retriever.__class__.__name__,
+            "vector_backend": getattr(manager, "vector_backend", "fallback"),
             "embedding_provider": manager.embedding_service.provider,
+            "embedding": manager.embedding_service.diagnostics(),
+            "local_models_enabled": manager.embedding_service.local_models_enabled,
             "llm_available": manager.llm_service.available,
             "memory_types": ["episodic", "semantic", "preference"],
+            "ai_pipeline": {
+                "topic_classifier": "semantic_prototypes+sklearn_cosine",
+                "importance_model": "fixed_logistic_features",
+                "sentiment": "transformer_lazy_or_deterministic_fallback",
+                "analytics": "pandas_numpy",
+            },
+            "latency_ms": 0,
         }
+        diagnostics = getattr(manager.retriever, "diagnostics", None)
+        if callable(diagnostics):
+            response["chroma"] = diagnostics()
+        # Real DB health check
+        if manager._using_supabase:
+            try:
+                db_health = manager.storage.health_check()
+                response["database"] = db_health
+                if not db_health.get("connected"):
+                    response["status"] = "degraded"
+                    response["warning"] = "Database connectivity issue"
+            except Exception as db_exc:
+                response["database"] = {"connected": False, "error": str(db_exc)}
+                response["status"] = "degraded"
+        response["latency_ms"] = round((time.time() - start) * 1000, 2)
+        return response
     except Exception as exc:
+        elapsed_ms = round((time.time() - start) * 1000, 2)
+        logger.error("Health check failed: %s", exc)
         return {
             "success": True,
             "status": "starting",
             "service": "UniMind Memory API",
-            "version": "2.1.0",
+            "version": "2.2.0",
             "note": f"Initializing: {exc}",
+            "latency_ms": elapsed_ms,
         }
 
 
 @router.post("/memory/store", response_model=MemoryStoreResponse)
 def store_memory(request: MemoryStoreRequest):
+    logger.info("POST /memory/store user=%s type=%s", request.user_id, request.memory_type)
     try:
         manager = get_memory_manager()
         memory_id = manager.store_memory(
@@ -105,12 +150,14 @@ def store_memory(request: MemoryStoreRequest):
             summary=request.summary,
             metadata=request.metadata,
         )
+        logger.info("Memory stored: id=%s user=%s", memory_id, request.user_id)
         return MemoryStoreResponse(
             success=True,
             memory_id=memory_id,
             message="Memory stored",
         )
     except Exception as exc:
+        logger.error("Memory store failed for user=%s: %s", request.user_id, exc)
         return _error(f"Memory was not stored: {exc}")
 
 
@@ -172,8 +219,10 @@ def add_message_to_memory(request: AddMessageRequest):
 
 @router.post("/memory/exchange")
 def add_exchange_to_memory(request: AddExchangeRequest):
+    logger.info("POST /memory/exchange user=%s session=%s", request.user_id, request.session_id)
+    start = time.time()
     try:
-        return get_memory_manager().add_exchange(
+        result = get_memory_manager().add_exchange(
             user_id=request.user_id,
             user_message=request.user_message,
             assistant_message=request.assistant_message,
@@ -181,7 +230,14 @@ def add_exchange_to_memory(request: AddExchangeRequest):
             tags=request.tags,
             ai_enrich=request.ai_enrich,
         )
+        elapsed = round(time.time() - start, 2)
+        logger.info(
+            "Exchange stored: user=%s facts=%s episode=%s (%.2fs)",
+            request.user_id, result.get("facts_added"), result.get("episode_id"), elapsed,
+        )
+        return result
     except Exception as exc:
+        logger.error("Exchange store failed for user=%s: %s", request.user_id, exc, exc_info=True)
         return _error(f"Exchange was not stored: {exc}")
 
 
@@ -341,6 +397,14 @@ def get_memory_status(user_id: str):
     return MemoryStatusResponse(**get_memory_manager().get_status(user_id))
 
 
+@router.get(
+    "/memory/analytics/{user_id}",
+    response_model=MemoryAnalyticsResponse,
+)
+def get_memory_analytics(user_id: str):
+    return MemoryAnalyticsResponse(**get_memory_manager().get_analytics(user_id))
+
+
 @router.get("/memory/context/{user_id}")
 def get_memory_context(
     user_id: str,
@@ -349,6 +413,7 @@ def get_memory_context(
     max_chars: int = Query(default=2000, ge=500, le=6000),
     top_k: int = Query(default=5, ge=1, le=20),
 ):
+    start = time.time()
     try:
         payload = get_memory_manager().build_context_payload(
             user_id=user_id,
@@ -357,12 +422,19 @@ def get_memory_context(
             max_chars=max_chars,
             debug=debug,
         )
+        elapsed = round(time.time() - start, 3)
+        logger.info(
+            "Context built: user=%s query='%.40s' length=%d (%.3fs)",
+            user_id, query, payload.get("context_length", 0), elapsed,
+        )
         if not payload.get("warnings"):
             payload.pop("warnings", None)
         if not debug:
             payload.pop("debug", None)
         return payload
     except Exception as exc:
+        elapsed = round(time.time() - start, 3)
+        logger.error("Context build failed for user=%s: %s (%.3fs)", user_id, exc, elapsed)
         payload = {
             "success": True,
             "user_id": user_id,

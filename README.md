@@ -1,16 +1,22 @@
 # UniMind Memory Backend
 
-Simple FastAPI backend for a personalized AI assistant with long-term memory.
+FastAPI backend for a personalized AI assistant with long-term semantic memory.
 
-The refactored backend uses plain Python logic:
+The backend keeps UniMind's existing architecture while adding AI/DS retrieval
+and NLP components:
 
 - FastAPI for JSON APIs
-- SQLite for durable memory metadata and conversation logs
-- FAISS for semantic similarity search
+- Supabase PostgreSQL in production, SQLite for local fallback
+- ChromaDB as the primary persistent vector mirror
+- FAISS / Supabase array cosine retrieval as guarded fallbacks
 - Gemini embeddings when `GEMINI_API_KEY` is configured
-- deterministic local hash embeddings when no key is configured
+- optional SentenceTransformers embeddings behind env flags
+- sklearn cosine topic classification and logistic-style memory importance
+- pandas/numpy Memory Vault analytics
+- LangChain prompt templates and document chunking utilities
+- deterministic local hash embeddings when no model/key is configured
 
-No LangChain, LangGraph, agents, graph pipelines, ChromaDB, or orchestration frameworks are used.
+No LangGraph or agent framework is used.
 
 ## Folder Structure
 

@@ -17,9 +17,12 @@ from typing import Any, Iterable
 
 import numpy as np
 
+from .scoring import importance_label_for_score
+
 try:
     import psycopg2
     import psycopg2.extras
+    import psycopg2.pool
 except ImportError:  # pragma: no cover
     psycopg2 = None  # type: ignore[assignment]
 
@@ -30,6 +33,10 @@ try:
         SUPABASE_DB_PASSWORD,
         SUPABASE_DB_PORT,
         SUPABASE_DB_USER,
+        SUPABASE_CONNECT_RETRIES,
+        SUPABASE_POOL_MAX,
+        SUPABASE_POOL_MIN,
+        SUPABASE_STATEMENT_TIMEOUT_MS,
     )
 except ImportError:  # pragma: no cover
     from config import (  # type: ignore
@@ -38,6 +45,10 @@ except ImportError:  # pragma: no cover
         SUPABASE_DB_PASSWORD,
         SUPABASE_DB_PORT,
         SUPABASE_DB_USER,
+        SUPABASE_CONNECT_RETRIES,
+        SUPABASE_POOL_MAX,
+        SUPABASE_POOL_MIN,
+        SUPABASE_STATEMENT_TIMEOUT_MS,
     )
 
 logger = logging.getLogger(__name__)
@@ -82,30 +93,79 @@ class SupabaseStorage:
             "password": SUPABASE_DB_PASSWORD,
             "sslmode": "require",
             "connect_timeout": 30,
+            "options": f"-c statement_timeout={SUPABASE_STATEMENT_TIMEOUT_MS}",
         }
+        self._pool = None
+        self._init_pool()
         self._init_schema()
-        logger.info("SupabaseStorage connected to %s", SUPABASE_DB_HOST)
+        logger.info("SupabaseStorage connected to %s (pooled)", SUPABASE_DB_HOST)
+
+    def _init_pool(self) -> None:
+        """Create a threaded connection pool."""
+        pool_max = max(1, SUPABASE_POOL_MAX)
+        pool_min = max(1, min(SUPABASE_POOL_MIN, pool_max))
+        try:
+            self._pool = psycopg2.pool.ThreadedConnectionPool(
+                minconn=pool_min,
+                maxconn=pool_max,
+                **self._dsn,
+            )
+            logger.info(
+                "Supabase connection pool created (min=%d max=%d statement_timeout_ms=%d)",
+                pool_min,
+                pool_max,
+                SUPABASE_STATEMENT_TIMEOUT_MS,
+            )
+        except Exception as exc:
+            logger.error("Failed to create Supabase connection pool: %s", exc)
+            self._pool = None
+            raise
 
     @contextmanager
     def _connect(self):
-        max_retries = 3
-        retry_delay = 2.0
+        """Get a connection from the pool with auto-recovery."""
+        if self._pool is None or self._pool.closed:
+            logger.warning("Connection pool is closed, reinitializing...")
+            self._init_pool()
+
+        conn = None
+        max_retries = max(1, SUPABASE_CONNECT_RETRIES)
+        retry_delay = 1.0
         last_exc = None
-        
+
         for attempt in range(max_retries):
             try:
-                conn = psycopg2.connect(**self._dsn)
+                conn = self._pool.getconn()
+                with conn.cursor() as cur:
+                    cur.execute("SELECT 1")
                 break
             except Exception as exc:
                 last_exc = exc
+                if conn is not None:
+                    try:
+                        self._pool.putconn(conn, close=True)
+                    except Exception:
+                        pass
+                    conn = None
                 if attempt < max_retries - 1:
-                    logger.warning("Supabase connection failed (attempt %d/%d). Retrying in %.1fs: %s", 
-                                   attempt + 1, max_retries, retry_delay, exc)
+                    logger.warning(
+                        "Supabase connection failed (attempt %d/%d). Retrying in %.1fs: %s",
+                        attempt + 1, max_retries, retry_delay, exc,
+                    )
                     time.sleep(retry_delay)
                     retry_delay *= 2.0
                 else:
-                    logger.error("Supabase connection failed after %d attempts: %s", max_retries, exc)
-                    raise
+                    logger.error(
+                        "Supabase connection failed after %d attempts: %s",
+                        max_retries, exc,
+                    )
+                    # Pool may be stale; recreate it
+                    try:
+                        self._pool.closeall()
+                    except Exception:
+                        pass
+                    self._init_pool()
+                    raise last_exc
 
         try:
             yield conn
@@ -114,9 +174,43 @@ class SupabaseStorage:
             conn.rollback()
             raise
         finally:
-            conn.close()
+            try:
+                self._pool.putconn(conn)
+            except Exception:
+                pass
+
+    def health_check(self) -> dict[str, Any]:
+        """Test database connectivity and return diagnostic info."""
+        start = time.time()
+        try:
+            with self._connect() as conn:
+                cur = conn.cursor()
+                cur.execute("SELECT COUNT(*) FROM memories")
+                memory_count = cur.fetchone()[0]
+                cur.execute("SELECT COUNT(*) FROM messages")
+                message_count = cur.fetchone()[0]
+            elapsed = round(time.time() - start, 3)
+            return {
+                "connected": True,
+                "host": SUPABASE_DB_HOST,
+                "memory_count": memory_count,
+                "message_count": message_count,
+                "latency_seconds": elapsed,
+                "pool_status": "active" if self._pool and not self._pool.closed else "closed",
+            }
+        except Exception as exc:
+            elapsed = round(time.time() - start, 3)
+            logger.error("Supabase health check failed: %s", exc)
+            return {
+                "connected": False,
+                "host": SUPABASE_DB_HOST,
+                "error": str(exc),
+                "latency_seconds": elapsed,
+                "pool_status": "active" if self._pool and not self._pool.closed else "closed",
+            }
 
     def _init_schema(self) -> None:
+        logger.info("Initializing Supabase schema...")
         with self._connect() as conn:
             cur = conn.cursor()
             cur.execute("""
@@ -142,6 +236,10 @@ class SupabaseStorage:
                     content_norm TEXT NOT NULL,
                     summary TEXT,
                     importance DOUBLE PRECISION NOT NULL DEFAULT 0.5,
+                    importance_score DOUBLE PRECISION DEFAULT 0.5,
+                    importance_label TEXT DEFAULT 'Medium',
+                    category TEXT DEFAULT 'General',
+                    sentiment TEXT DEFAULT 'Neutral',
                     source TEXT NOT NULL DEFAULT 'manual',
                     metadata_json TEXT NOT NULL DEFAULT '{}',
                     embedding REAL[],
@@ -160,6 +258,41 @@ class SupabaseStorage:
                     name TEXT PRIMARY KEY,
                     applied_at TEXT NOT NULL
                 );
+            """)
+            cur.execute("""
+                ALTER TABLE memories
+                ADD COLUMN IF NOT EXISTS importance_score DOUBLE PRECISION DEFAULT 0.5;
+                ALTER TABLE memories
+                ADD COLUMN IF NOT EXISTS importance_label TEXT DEFAULT 'Medium';
+                ALTER TABLE memories
+                ADD COLUMN IF NOT EXISTS category TEXT DEFAULT 'General';
+                ALTER TABLE memories
+                ADD COLUMN IF NOT EXISTS sentiment TEXT DEFAULT 'Neutral';
+
+                UPDATE memories
+                SET importance_score = importance
+                WHERE importance_score IS NULL;
+
+                UPDATE memories
+                SET importance_label = CASE
+                    WHEN COALESCE(importance_score, importance, 0.5) >= 0.75 THEN 'High'
+                    WHEN COALESCE(importance_score, importance, 0.5) >= 0.45 THEN 'Medium'
+                    ELSE 'Low'
+                END
+                WHERE importance_label IS NULL OR BTRIM(importance_label) = '';
+
+                UPDATE memories
+                SET category = 'General'
+                WHERE category IS NULL OR BTRIM(category) = '';
+
+                UPDATE memories
+                SET sentiment = 'Neutral'
+                WHERE sentiment IS NULL OR BTRIM(sentiment) = '';
+
+                CREATE INDEX IF NOT EXISTS idx_memories_user_category
+                    ON memories(user_id, category);
+                CREATE INDEX IF NOT EXISTS idx_memories_user_sentiment
+                    ON memories(user_id, sentiment);
             """)
             # Cosine similarity function for vector search
             cur.execute("""
@@ -185,6 +318,7 @@ class SupabaseStorage:
                     END
                 $$;
             """)
+        logger.info("Supabase schema initialized successfully")
 
     # ── Messages ──────────────────────────────────────────────────
 
@@ -221,6 +355,7 @@ class SupabaseStorage:
                     _json_dumps(row["metadata"]), row["created_at"],
                 ),
             )
+        logger.debug("Message stored: id=%s user=%s role=%s", message_id, user_id, role)
         return row
 
     def get_recent_messages(
@@ -269,6 +404,7 @@ class SupabaseStorage:
         with self._connect() as conn:
             cur = conn.cursor()
             cur.execute(f"DELETE FROM messages WHERE {where}", params)
+        logger.info("Cleared messages for user=%s session=%s", user_id, session_id)
 
     # ── Memories ──────────────────────────────────────────────────
 
@@ -285,12 +421,35 @@ class SupabaseStorage:
         metadata: dict[str, Any] | None,
         embedding: np.ndarray | None,
         embedding_provider: str | None,
+        importance_score: float | None = None,
+        importance_label: str | None = None,
+        category: str | None = None,
+        sentiment: str | None = None,
         created_at: str | None = None,
         updated_at: str | None = None,
     ) -> bool:
         now = updated_at or _utc_now()
         existing = self.get_memory(memory_id)
         created = created_at or (existing["created_at"] if existing else now)
+        final_importance = float(max(0.0, min(1.0, importance)))
+        final_importance_score = float(
+            max(0.0, min(1.0, importance_score if importance_score is not None else importance))
+        )
+        final_importance_label = (
+            importance_label.strip()
+            if isinstance(importance_label, str) and importance_label.strip()
+            else importance_label_for_score(final_importance_score)
+        )
+        final_category = (
+            category.strip()
+            if isinstance(category, str) and category.strip()
+            else "General"
+        )
+        final_sentiment = (
+            sentiment.strip()
+            if isinstance(sentiment, str) and sentiment.strip()
+            else "Neutral"
+        )
         emb_list: list[float] | None = None
         emb_dim: int | None = None
         if embedding is not None:
@@ -304,10 +463,11 @@ class SupabaseStorage:
                 """
                 INSERT INTO memories (
                     id, user_id, memory_type, content, content_norm, summary,
-                    importance, source, metadata_json, embedding, embedding_dim,
+                    importance, importance_score, importance_label, category,
+                    sentiment, source, metadata_json, embedding, embedding_dim,
                     embedding_provider, created_at, updated_at, last_accessed_at
                 )
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                 ON CONFLICT(id) DO UPDATE SET
                     user_id = EXCLUDED.user_id,
                     memory_type = EXCLUDED.memory_type,
@@ -315,6 +475,10 @@ class SupabaseStorage:
                     content_norm = EXCLUDED.content_norm,
                     summary = EXCLUDED.summary,
                     importance = EXCLUDED.importance,
+                    importance_score = EXCLUDED.importance_score,
+                    importance_label = EXCLUDED.importance_label,
+                    category = EXCLUDED.category,
+                    sentiment = EXCLUDED.sentiment,
                     source = EXCLUDED.source,
                     metadata_json = EXCLUDED.metadata_json,
                     embedding = EXCLUDED.embedding,
@@ -325,12 +489,19 @@ class SupabaseStorage:
                 (
                     memory_id, user_id, memory_type, content,
                     _normalize_text(content), summary,
-                    float(max(0.0, min(1.0, importance))), source,
+                    final_importance, final_importance_score,
+                    final_importance_label, final_category,
+                    final_sentiment, source,
                     _json_dumps(metadata), emb_list, emb_dim,
                     embedding_provider, created, now,
                     existing.get("last_accessed_at") if existing else None,
                 ),
             )
+        action = "updated" if existing else "created"
+        logger.info(
+            "Memory %s: id=%s type=%s provider=%s dim=%s user=%s",
+            action, memory_id, memory_type, embedding_provider, emb_dim, user_id,
+        )
         return existing is not None
 
     def update_embedding(
@@ -348,13 +519,21 @@ class SupabaseStorage:
                 """,
                 (vec.tolist(), int(vec.shape[0]), embedding_provider, _utc_now(), memory_id),
             )
+        logger.debug("Embedding updated: id=%s provider=%s dim=%d", memory_id, embedding_provider, vec.shape[0])
 
     def update_importance(self, memory_id: str, importance: float) -> None:
+        score = float(max(0.0, min(1.0, importance)))
         with self._connect() as conn:
             cur = conn.cursor()
             cur.execute(
-                "UPDATE memories SET importance = %s WHERE id = %s",
-                (float(max(0.0, min(1.0, importance))), memory_id),
+                """
+                UPDATE memories
+                SET importance = %s,
+                    importance_score = %s,
+                    importance_label = %s
+                WHERE id = %s
+                """,
+                (score, score, importance_label_for_score(score), memory_id),
             )
 
     def update_metadata(self, memory_id: str, metadata: dict[str, Any]) -> None:
@@ -373,6 +552,35 @@ class SupabaseStorage:
             cur.execute("SELECT * FROM memories WHERE id = %s", (memory_id,))
             row = cur.fetchone()
         return self._memory_from_row(row, include_embedding) if row else None
+
+    def get_memories_by_ids(
+        self,
+        memory_ids: Iterable[str],
+        include_embedding: bool = False,
+    ) -> dict[str, dict[str, Any]]:
+        ids = list(dict.fromkeys(str(memory_id) for memory_id in memory_ids if memory_id))
+        if not ids:
+            return {}
+        placeholders = ",".join(["%s"] * len(ids))
+        start = time.time()
+        with self._connect() as conn:
+            cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            cur.execute(
+                f"SELECT * FROM memories WHERE id IN ({placeholders})",
+                ids,
+            )
+            rows = cur.fetchall()
+        memories = {
+            row["id"]: self._memory_from_row(row, include_embedding)
+            for row in rows
+        }
+        logger.debug(
+            "Batch memory hydrate requested=%d found=%d latency_ms=%.1f",
+            len(ids),
+            len(memories),
+            (time.time() - start) * 1000,
+        )
+        return memories
 
     def find_duplicate_memory(
         self, user_id: str, memory_type: str, content: str,
@@ -447,6 +655,7 @@ class SupabaseStorage:
         with self._connect() as conn:
             cur = conn.cursor()
             cur.execute("DELETE FROM memories WHERE id = %s", (memory_id,))
+        logger.info("Memory deleted: id=%s", memory_id)
 
     def clear_memories(
         self, user_id: str, memory_types: Iterable[str] | None = None,
@@ -462,12 +671,14 @@ class SupabaseStorage:
                 )
             else:
                 cur.execute("DELETE FROM memories WHERE user_id = %s", (user_id,))
+        logger.info("Cleared memories for user=%s types=%s", user_id, types or "all")
 
     def clear_user(self, user_id: str) -> None:
         with self._connect() as conn:
             cur = conn.cursor()
             cur.execute("DELETE FROM messages WHERE user_id = %s", (user_id,))
             cur.execute("DELETE FROM memories WHERE user_id = %s", (user_id,))
+        logger.info("Cleared ALL data for user=%s", user_id)
 
     def has_migration(self, name: str) -> bool:
         with self._connect() as conn:
@@ -494,22 +705,41 @@ class SupabaseStorage:
         query_embedding: np.ndarray,
         user_id: str,
         top_k: int = 50,
+        embedding_provider: str | None = None,
+        embedding_dim: int | None = None,
     ) -> list[tuple[str, float]]:
         """Return (memory_id, cosine_similarity) pairs."""
         vec = np.asarray(query_embedding, dtype=np.float32).tolist()
+        expected_dim = int(embedding_dim or len(vec))
+        provider_clause = ""
+        params: list[Any] = [vec, user_id, expected_dim]
+        if embedding_provider:
+            provider_clause = "AND embedding_provider = %s"
+            params.append(embedding_provider)
+        params.append(top_k)
+        start = time.time()
         with self._connect() as conn:
             cur = conn.cursor()
             cur.execute(
-                """
+                f"""
                 SELECT id, cosine_similarity(embedding, %s::REAL[]) AS sim
                 FROM memories
-                WHERE user_id = %s AND embedding IS NOT NULL
+                WHERE user_id = %s
+                  AND embedding IS NOT NULL
+                  AND embedding_dim = %s
+                  {provider_clause}
                 ORDER BY sim DESC
                 LIMIT %s
                 """,
-                (vec, user_id, top_k),
+                params,
             )
-            return [(row[0], float(row[1])) for row in cur.fetchall()]
+            results = [(row[0], float(row[1])) for row in cur.fetchall()]
+        elapsed = round(time.time() - start, 3)
+        logger.info(
+            "Vector search: user=%s top_k=%d results=%d latency=%.3fs",
+            user_id, top_k, len(results), elapsed,
+        )
+        return results
 
     # ── Row mappers ───────────────────────────────────────────────
 
@@ -528,6 +758,18 @@ class SupabaseStorage:
     def _memory_from_row(
         self, row: dict, include_embedding: bool = False,
     ) -> dict[str, Any]:
+        metadata = _json_loads(row["metadata_json"])
+        score = float(row.get("importance_score") or row["importance"])
+        ai_category = str(row.get("category") or "General").strip() or "General"
+        sentiment = str(row.get("sentiment") or "Neutral").strip() or "Neutral"
+        legacy_category = (
+            metadata.get("memory_category")
+            or metadata.get("legacy_category")
+            or metadata.get("category")
+        )
+        if not legacy_category:
+            legacy_category = "preference" if row["memory_type"] == "preference" else row["memory_type"]
+        legacy_category = str(legacy_category).strip().lower() or "general"
         memory = {
             "id": row["id"],
             "user_id": row["user_id"],
@@ -536,8 +778,15 @@ class SupabaseStorage:
             "fact": row["content"],
             "summary": row["summary"] or row["content"],
             "importance": float(row["importance"]),
+            "importance_score": score,
+            "importance_label": str(row.get("importance_label") or "").strip()
+            or importance_label_for_score(score),
+            "category": legacy_category,
+            "memory_category": legacy_category,
+            "ai_category": ai_category,
+            "sentiment": sentiment,
             "source": row["source"],
-            "metadata": _json_loads(row["metadata_json"]),
+            "metadata": metadata,
             "embedding_dim": row["embedding_dim"],
             "embedding_provider": row["embedding_provider"],
             "created_at": row["created_at"],
@@ -546,13 +795,6 @@ class SupabaseStorage:
             "timestamp": row["created_at"],
             "date_added": row["created_at"][:10] if row["created_at"] else "",
         }
-        category = memory["metadata"].get("category")
-        if category:
-            memory["category"] = category
-        elif memory["memory_type"] == "preference":
-            memory["category"] = "preference"
-        else:
-            memory["category"] = memory["memory_type"]
 
         if include_embedding and row["embedding"] is not None:
             memory["embedding"] = np.asarray(row["embedding"], dtype=np.float32)

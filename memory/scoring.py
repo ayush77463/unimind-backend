@@ -58,6 +58,15 @@ def clamp_score(value: float) -> float:
     return max(0.0, min(1.0, float(value)))
 
 
+def importance_label_for_score(value: float) -> str:
+    score = clamp_score(value)
+    if score >= 0.75:
+        return "High"
+    if score >= 0.45:
+        return "Medium"
+    return "Low"
+
+
 def importance_for_category(category: str, memory_type: str = "semantic") -> float:
     key = (category or memory_type or "general").strip().lower()
     if memory_type == "preference":

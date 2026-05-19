@@ -12,6 +12,8 @@ from typing import Any, Iterable
 
 import numpy as np
 
+from .scoring import importance_label_for_score
+
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -87,6 +89,10 @@ class MemoryStorage:
                     content_norm TEXT NOT NULL,
                     summary TEXT,
                     importance REAL NOT NULL DEFAULT 0.5,
+                    importance_score REAL DEFAULT 0.5,
+                    importance_label TEXT DEFAULT 'Medium',
+                    category TEXT DEFAULT 'General',
+                    sentiment TEXT DEFAULT 'Neutral',
                     source TEXT NOT NULL DEFAULT 'manual',
                     metadata_json TEXT NOT NULL DEFAULT '{}',
                     embedding BLOB,
@@ -109,6 +115,52 @@ class MemoryStorage:
                 );
                 """
             )
+            self._ensure_memory_intelligence_columns(conn)
+
+    def _ensure_memory_intelligence_columns(self, conn: sqlite3.Connection) -> None:
+        columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(memories)").fetchall()
+        }
+        additions = {
+            "importance_score": "ALTER TABLE memories ADD COLUMN importance_score REAL DEFAULT 0.5",
+            "importance_label": "ALTER TABLE memories ADD COLUMN importance_label TEXT DEFAULT 'Medium'",
+            "category": "ALTER TABLE memories ADD COLUMN category TEXT DEFAULT 'General'",
+            "sentiment": "ALTER TABLE memories ADD COLUMN sentiment TEXT DEFAULT 'Neutral'",
+        }
+        for name, statement in additions.items():
+            if name not in columns:
+                conn.execute(statement)
+
+        conn.executescript(
+            """
+            UPDATE memories
+            SET importance_score = importance
+            WHERE importance_score IS NULL;
+
+            UPDATE memories
+            SET importance_label = CASE
+                WHEN COALESCE(importance_score, importance, 0.5) >= 0.75 THEN 'High'
+                WHEN COALESCE(importance_score, importance, 0.5) >= 0.45 THEN 'Medium'
+                ELSE 'Low'
+            END
+            WHERE importance_label IS NULL OR TRIM(importance_label) = '';
+
+            UPDATE memories
+            SET category = 'General'
+            WHERE category IS NULL OR TRIM(category) = '';
+
+            UPDATE memories
+            SET sentiment = 'Neutral'
+            WHERE sentiment IS NULL OR TRIM(sentiment) = '';
+
+            CREATE INDEX IF NOT EXISTS idx_memories_user_category
+            ON memories(user_id, category);
+
+            CREATE INDEX IF NOT EXISTS idx_memories_user_sentiment
+            ON memories(user_id, sentiment);
+            """
+        )
 
     def add_message(
         self,
@@ -209,12 +261,35 @@ class MemoryStorage:
         metadata: dict[str, Any] | None,
         embedding: np.ndarray | None,
         embedding_provider: str | None,
+        importance_score: float | None = None,
+        importance_label: str | None = None,
+        category: str | None = None,
+        sentiment: str | None = None,
         created_at: str | None = None,
         updated_at: str | None = None,
     ) -> bool:
         now = updated_at or utc_now()
         existing = self.get_memory(memory_id)
         created = created_at or (existing["created_at"] if existing else now)
+        final_importance = float(max(0.0, min(1.0, importance)))
+        final_importance_score = float(
+            max(0.0, min(1.0, importance_score if importance_score is not None else importance))
+        )
+        final_importance_label = (
+            importance_label.strip()
+            if isinstance(importance_label, str) and importance_label.strip()
+            else importance_label_for_score(final_importance_score)
+        )
+        final_category = (
+            category.strip()
+            if isinstance(category, str) and category.strip()
+            else "General"
+        )
+        final_sentiment = (
+            sentiment.strip()
+            if isinstance(sentiment, str) and sentiment.strip()
+            else "Neutral"
+        )
         vector_blob = None
         vector_dim = None
         if embedding is not None:
@@ -227,10 +302,11 @@ class MemoryStorage:
                 """
                 INSERT INTO memories (
                     id, user_id, memory_type, content, content_norm, summary,
-                    importance, source, metadata_json, embedding, embedding_dim,
+                    importance, importance_score, importance_label, category,
+                    sentiment, source, metadata_json, embedding, embedding_dim,
                     embedding_provider, created_at, updated_at, last_accessed_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     user_id = excluded.user_id,
                     memory_type = excluded.memory_type,
@@ -238,6 +314,10 @@ class MemoryStorage:
                     content_norm = excluded.content_norm,
                     summary = excluded.summary,
                     importance = excluded.importance,
+                    importance_score = excluded.importance_score,
+                    importance_label = excluded.importance_label,
+                    category = excluded.category,
+                    sentiment = excluded.sentiment,
                     source = excluded.source,
                     metadata_json = excluded.metadata_json,
                     embedding = excluded.embedding,
@@ -252,7 +332,11 @@ class MemoryStorage:
                     content,
                     normalize_text(content),
                     summary,
-                    float(max(0.0, min(1.0, importance))),
+                    final_importance,
+                    final_importance_score,
+                    final_importance_label,
+                    final_category,
+                    final_sentiment,
                     source,
                     _json_dumps(metadata),
                     vector_blob,
@@ -290,10 +374,17 @@ class MemoryStorage:
             )
 
     def update_importance(self, memory_id: str, importance: float) -> None:
+        score = float(max(0.0, min(1.0, importance)))
         with self._connect() as conn:
             conn.execute(
-                "UPDATE memories SET importance = ? WHERE id = ?",
-                (float(max(0.0, min(1.0, importance))), memory_id),
+                """
+                UPDATE memories
+                SET importance = ?,
+                    importance_score = ?,
+                    importance_label = ?
+                WHERE id = ?
+                """,
+                (score, score, importance_label_for_score(score), memory_id),
             )
 
     def update_metadata(self, memory_id: str, metadata: dict[str, Any]) -> None:
@@ -314,6 +405,25 @@ class MemoryStorage:
                 (memory_id,),
             ).fetchone()
         return self._memory_from_row(row, include_embedding) if row else None
+
+    def get_memories_by_ids(
+        self,
+        memory_ids: Iterable[str],
+        include_embedding: bool = False,
+    ) -> dict[str, dict[str, Any]]:
+        ids = list(dict.fromkeys(str(memory_id) for memory_id in memory_ids if memory_id))
+        if not ids:
+            return {}
+        placeholders = ",".join("?" for _ in ids)
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM memories WHERE id IN ({placeholders})",
+                ids,
+            ).fetchall()
+        return {
+            row["id"]: self._memory_from_row(row, include_embedding)
+            for row in rows
+        }
 
     def find_duplicate_memory(
         self,
@@ -443,6 +553,31 @@ class MemoryStorage:
         row: sqlite3.Row,
         include_embedding: bool = False,
     ) -> dict[str, Any]:
+        columns = set(row.keys())
+        metadata = _json_loads(row["metadata_json"])
+        score = float(
+            row["importance_score"]
+            if "importance_score" in columns and row["importance_score"] is not None
+            else row["importance"]
+        )
+        ai_category = (
+            str(row["category"]).strip()
+            if "category" in columns and row["category"]
+            else "General"
+        )
+        sentiment = (
+            str(row["sentiment"]).strip()
+            if "sentiment" in columns and row["sentiment"]
+            else "Neutral"
+        )
+        legacy_category = (
+            metadata.get("memory_category")
+            or metadata.get("legacy_category")
+            or metadata.get("category")
+        )
+        if not legacy_category:
+            legacy_category = "preference" if row["memory_type"] == "preference" else row["memory_type"]
+        legacy_category = str(legacy_category).strip().lower() or "general"
         memory = {
             "id": row["id"],
             "user_id": row["user_id"],
@@ -451,8 +586,18 @@ class MemoryStorage:
             "fact": row["content"],
             "summary": row["summary"] or row["content"],
             "importance": float(row["importance"]),
+            "importance_score": score,
+            "importance_label": (
+                str(row["importance_label"]).strip()
+                if "importance_label" in columns and row["importance_label"]
+                else importance_label_for_score(score)
+            ),
+            "category": legacy_category,
+            "memory_category": legacy_category,
+            "ai_category": ai_category,
+            "sentiment": sentiment,
             "source": row["source"],
-            "metadata": _json_loads(row["metadata_json"]),
+            "metadata": metadata,
             "embedding_dim": row["embedding_dim"],
             "embedding_provider": row["embedding_provider"],
             "created_at": row["created_at"],
@@ -461,13 +606,6 @@ class MemoryStorage:
             "timestamp": row["created_at"],
             "date_added": row["created_at"][:10],
         }
-        category = memory["metadata"].get("category")
-        if category:
-            memory["category"] = category
-        elif memory["memory_type"] == "preference":
-            memory["category"] = "preference"
-        else:
-            memory["category"] = memory["memory_type"]
 
         if include_embedding and row["embedding"] is not None:
             memory["embedding"] = np.frombuffer(row["embedding"], dtype=np.float32)

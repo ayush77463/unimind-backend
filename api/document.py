@@ -26,6 +26,7 @@ async def upload_document(
     """Extract text from an uploaded document (PDF, DOCX, TXT, etc.)."""
     filename = file.filename or "unknown"
     ext = Path(filename).suffix.lower()
+    mime_type = file.content_type or "application/octet-stream"
     logger.info("Document upload: %s (%s) from user %s", filename, ext, user_id)
 
     try:
@@ -91,6 +92,11 @@ async def upload_document(
         "Extracted %d chars from %s using %s",
         len(extracted_text), filename, extraction_method,
     )
+    chunks = _chunk_document(
+        extracted_text,
+        filename=filename,
+        mime_type=mime_type,
+    )
 
     return {
         "success": True,
@@ -99,7 +105,65 @@ async def upload_document(
         "char_count": len(extracted_text),
         "extraction_method": extraction_method,
         "file_size_bytes": len(raw_bytes),
+        "mime_type": mime_type,
+        "chunks": chunks,
+        "chunk_count": len(chunks),
+        "document_summary": _document_summary(extracted_text, filename),
     }
+
+
+def _chunk_document(
+    text: str,
+    *,
+    filename: str,
+    mime_type: str,
+    chunk_size: int = 1200,
+    chunk_overlap: int = 160,
+) -> list[dict[str, object]]:
+    clean_text = text.strip()
+    if not clean_text:
+        return []
+    try:
+        from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+        splitter = RecursiveCharacterTextSplitter(
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+            separators=["\n\n", "\n", ". ", " ", ""],
+        )
+        pieces = splitter.split_text(clean_text)
+    except Exception as exc:
+        logger.warning("LangChain document chunking unavailable; using fallback: %s", exc)
+        pieces = [
+            clean_text[index : index + chunk_size]
+            for index in range(0, len(clean_text), chunk_size - chunk_overlap)
+        ]
+
+    chunks: list[dict[str, object]] = []
+    for index, chunk in enumerate(pieces):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        chunks.append(
+            {
+                "text": chunk,
+                "metadata": {
+                    "filename": filename,
+                    "mime_type": mime_type,
+                    "chunk_index": index,
+                    "char_count": len(chunk),
+                    "source": "document_upload",
+                },
+            }
+        )
+    return chunks
+
+
+def _document_summary(text: str, filename: str, limit: int = 600) -> str:
+    clean = " ".join(text.split())
+    if len(clean) <= limit:
+        return clean
+    return f"{filename}: {clean[: max(0, limit - len(filename) - 6)].rstrip()}..."
 
 
 def _extract_pdf(raw_bytes: bytes, filename: str) -> tuple[str, str]:
